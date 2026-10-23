@@ -2,14 +2,21 @@ package org.moontechlab.selenetv.service
 
 import android.util.Log
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.moontechlab.selenetv.model.LiveSource
 import org.moontechlab.selenetv.model.SearchResource
+import java.io.File
+import java.io.InputStream
+import java.io.ByteArrayOutputStream
 
 object SubscriptionService {
     private const val TAG = "SubscriptionService"
+    private const val MAX_SUBSCRIPTION_BYTES = 5 * 1024 * 1024 // 5 MB 上限
 
     class SubscriptionException(message: String) : Exception(message)
 
@@ -20,26 +27,38 @@ object SubscriptionService {
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
 
-    /** 纯解析：Base58 解码后的 JSON 字符串 → ParsedSubscription。失败抛 SubscriptionException。 */
+    /**
+     * 纯解析：JSON 字符串 → ParsedSubscription。
+     * 兼容原生 Selene 格式（api_site / lives 字典）及 TVBox 格式（sites / lives / channels 数组与字典）。
+     * 失败抛 SubscriptionException。
+     */
     fun parseSubscriptionJson(text: String): ParsedSubscription {
-        val root = try {
-            json.parseToJsonElement(text).jsonObject
+        val rootElement: JsonElement = try {
+            json.parseToJsonElement(text)
         } catch (e: Exception) {
             throw SubscriptionException("订阅内容格式无效: ${e.message}")
         }
 
-        val apiSiteMap = runCatching { root["api_site"]?.jsonObject }.getOrNull() ?: emptyMap()
-        val livesMap = runCatching { root["lives"]?.jsonObject }.getOrNull() ?: emptyMap()
+        val searchResources = mutableListOf<SearchResource>()
+        val liveSources = mutableListOf<LiveSource>()
 
-        val searchResources = apiSiteMap.entries.mapNotNull { (mapKey, value) ->
-            try {
-                val obj = value.jsonObject
+        fun parseSearchResource(mapKey: String, elem: JsonElement): SearchResource? {
+            return try {
+                if (elem !is JsonObject) return null
+                val key = elem["key"]?.jsonPrimitive?.contentOrNull ?: mapKey
+                val name = elem["name"]?.jsonPrimitive?.contentOrNull ?: key
+                val api = elem["api"]?.jsonPrimitive?.contentOrNull
+                    ?: elem["ext"]?.jsonPrimitive?.contentOrNull
+                    ?: ""
+                if (api.isEmpty()) return null
+                val detail = elem["detail"]?.jsonPrimitive?.contentOrNull
+                val from = elem["from"]?.jsonPrimitive?.contentOrNull
                 SearchResource(
-                    key = obj["key"]?.jsonPrimitive?.contentOrNull ?: mapKey,
-                    name = obj["name"]?.jsonPrimitive?.contentOrNull ?: "",
-                    api = obj["api"]?.jsonPrimitive?.contentOrNull ?: "",
-                    detail = obj["detail"]?.jsonPrimitive?.contentOrNull,
-                    from = obj["from"]?.jsonPrimitive?.contentOrNull,
+                    key = key,
+                    name = name,
+                    api = api,
+                    detail = detail,
+                    from = from,
                     disabled = false,
                 )
             } catch (_: Exception) {
@@ -47,20 +66,66 @@ object SubscriptionService {
             }
         }
 
-        val liveSources = livesMap.entries.mapNotNull { (mapKey, value) ->
-            try {
-                val obj = value.jsonObject
+        fun parseLiveSource(mapKey: String, elem: JsonElement): LiveSource? {
+            return try {
+                if (elem !is JsonObject) return null
+                val key = elem["key"]?.jsonPrimitive?.contentOrNull ?: mapKey
+                val name = elem["name"]?.jsonPrimitive?.contentOrNull ?: key
+                val url = elem["url"]?.jsonPrimitive?.contentOrNull ?: ""
+                if (url.isEmpty()) return null
+                val ua = elem["ua"]?.jsonPrimitive?.contentOrNull ?: ""
+                val epg = elem["epg"]?.jsonPrimitive?.contentOrNull ?: ""
+                val from = elem["from"]?.jsonPrimitive?.contentOrNull ?: ""
                 LiveSource(
-                    key = obj["key"]?.jsonPrimitive?.contentOrNull ?: mapKey,
-                    name = obj["name"]?.jsonPrimitive?.contentOrNull ?: "",
-                    url = obj["url"]?.jsonPrimitive?.contentOrNull ?: "",
-                    ua = obj["ua"]?.jsonPrimitive?.contentOrNull ?: "",
-                    epg = obj["epg"]?.jsonPrimitive?.contentOrNull ?: "",
-                    from = obj["from"]?.jsonPrimitive?.contentOrNull ?: "",
+                    key = key,
+                    name = name,
+                    url = url,
+                    ua = ua,
+                    epg = epg,
+                    from = from,
                     disabled = false,
                 )
             } catch (_: Exception) {
                 null
+            }
+        }
+
+        if (rootElement is JsonObject) {
+            // 解析搜索源：优先取 api_site，不存在则取 sites
+            val sitesElem = rootElement["api_site"] ?: rootElement["sites"]
+            when (sitesElem) {
+                is JsonObject -> {
+                    sitesElem.entries.forEach { (mapKey, value) ->
+                        parseSearchResource(mapKey, value)?.let { searchResources.add(it) }
+                    }
+                }
+                is JsonArray -> {
+                    sitesElem.forEachIndexed { idx, value ->
+                        parseSearchResource("site_$idx", value)?.let { searchResources.add(it) }
+                    }
+                }
+                else -> {}
+            }
+
+            // 解析直播源：优先取 lives，不存在则取 channels
+            val livesElem = rootElement["lives"] ?: rootElement["channels"]
+            when (livesElem) {
+                is JsonObject -> {
+                    livesElem.entries.forEach { (mapKey, value) ->
+                        parseLiveSource(mapKey, value)?.let { liveSources.add(it) }
+                    }
+                }
+                is JsonArray -> {
+                    livesElem.forEachIndexed { idx, value ->
+                        parseLiveSource("live_$idx", value)?.let { liveSources.add(it) }
+                    }
+                }
+                else -> {}
+            }
+        } else if (rootElement is JsonArray) {
+            // 直接为站点数组
+            rootElement.forEachIndexed { idx, value ->
+                parseSearchResource("site_$idx", value)?.let { searchResources.add(it) }
             }
         }
 
@@ -72,18 +137,91 @@ object SubscriptionService {
     }
 
     /**
-     * 同步阻塞：HTTP GET 订阅 URL → Base58 解码 → JSON 解析 → 可达性校验。失败抛 SubscriptionException。
+     * 同步阻塞：获取订阅内容（支持 HTTP/HTTPS 网络链接及 file:// 或 / 本地文件路径）
+     * 自动识别 Base58 编码或直接 JSON 内容，解析并返回 ParsedSubscription。
      * 必须在 Dispatchers.IO 调用。
      */
-    fun fetchAndParse(url: String): ParsedSubscription {
-        val body = httpGet(url)
-        val decoded = try {
-            org.moontechlab.selenetv.util.Base58.decode(body)
-        } catch (e: Exception) {
-            throw SubscriptionException("订阅内容格式无效: Base58 解码失败 (${e.message})")
+    fun fetchAndParse(urlOrPath: String): ParsedSubscription {
+        val body = loadContent(urlOrPath)
+        val trimmed = body.trim()
+        val text = if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+            // 原生明文 JSON
+            trimmed
+        } else {
+            // 尝试 Base58 解码，失败则回退到原始明文
+            try {
+                val decoded = org.moontechlab.selenetv.util.Base58.decode(trimmed)
+                String(decoded, Charsets.UTF_8)
+            } catch (e: Exception) {
+                trimmed
+            }
         }
-        val text = String(decoded, Charsets.UTF_8)
         return parseSubscriptionJson(text)
+    }
+
+    /**
+     * 读取订阅内容：网络 URL 或 本地文件
+     */
+    private fun loadContent(urlOrPath: String): String {
+        val trimmed = urlOrPath.trim()
+        val lower = trimmed.lowercase()
+        return when {
+            lower.startsWith("http://") || lower.startsWith("https://") -> {
+                httpGet(trimmed)
+            }
+            lower.startsWith("file://") -> {
+                val path = trimmed.substring(7)
+                readFileContent(path)
+            }
+            trimmed.startsWith("/") -> {
+                readFileContent(trimmed)
+            }
+            else -> {
+                val file = File(trimmed)
+                if (file.exists() && file.isFile) {
+                    readFileContent(file.absolutePath)
+                } else {
+                    throw SubscriptionException("订阅链接协议不支持（支持 http/https 或本地文件路径）")
+                }
+            }
+        }
+    }
+
+    /**
+     * 读取本地文件内容，兼顾 Android 常见存储路径映射
+     */
+    private fun readFileContent(rawPath: String): String {
+        val path = when {
+            rawPath.startsWith("/sdcard/") && !File(rawPath).exists() -> {
+                val alt = rawPath.replace("/sdcard/", "/storage/emulated/0/")
+                if (File(alt).exists()) alt else rawPath
+            }
+            rawPath.startsWith("/storage/emulated/0/") && !File(rawPath).exists() -> {
+                val alt = rawPath.replace("/storage/emulated/0/", "/sdcard/")
+                if (File(alt).exists()) alt else rawPath
+            }
+            else -> rawPath
+        }
+
+        val file = File(path)
+        if (!file.exists()) {
+            throw SubscriptionException("本地文件不存在: $path")
+        }
+        if (!file.isFile) {
+            throw SubscriptionException("指定路径不是文件: $path")
+        }
+        if (!file.canRead()) {
+            throw SubscriptionException("本地文件无读取权限（请检查存储权限设置）: $path")
+        }
+        if (file.length() > MAX_SUBSCRIPTION_BYTES) {
+            throw SubscriptionException("本地文件超过 5MB 上限")
+        }
+
+        return try {
+            file.readText(Charsets.UTF_8).trim()
+        } catch (e: Exception) {
+            throw SubscriptionException("读取本地文件失败: ${e.message}")
+        }
     }
 
     /**
@@ -94,7 +232,6 @@ object SubscriptionService {
         val url = org.moontechlab.selenetv.data.local.LocalStore.getSubscriptionUrl() ?: return@withContext false
         runCatching { fetchAndParse(url) }.fold(
             onSuccess = { parsed ->
-                // 防竞态：拉取可能耗时数秒；落盘前再确认订阅 URL 未被用户改动，避免用旧 URL 的源覆盖新订阅的源
                 val currentUrl = org.moontechlab.selenetv.data.local.LocalStore.getSubscriptionUrl()
                 if (currentUrl != url) {
                     Log.w(TAG, "刷新期间订阅 URL 已变更，丢弃旧拉取结果")
@@ -125,7 +262,6 @@ object SubscriptionService {
             throw SubscriptionException("订阅链接协议不支持（仅 http/https）")
         }
         val conn = u.openConnection() as java.net.HttpURLConnection
-        // 自签证书：沿用项目约定，HTTPS 时信任所有 + 跳过 hostname 校验
         if (conn is javax.net.ssl.HttpsURLConnection) {
             conn.sslSocketFactory = trustAllSslSocketFactory()
             conn.hostnameVerifier = javax.net.ssl.HostnameVerifier { _, _ -> true }
@@ -146,13 +282,8 @@ object SubscriptionService {
         }
     }
 
-    private const val MAX_SUBSCRIPTION_BYTES = 1 * 1024 * 1024  // 1 MB 上限：防止恶意订阅 OOM
-
-    /**
-     * 读取流并限制最大字节数。超出 cap 抛 SubscriptionException。
-     */
-    private fun readBytesCapped(input: java.io.InputStream, cap: Int): ByteArray {
-        val buf = java.io.ByteArrayOutputStream()
+    private fun readBytesCapped(input: InputStream, cap: Int): ByteArray {
+        val buf = ByteArrayOutputStream()
         val tmp = ByteArray(8192)
         var total = 0
         while (true) {

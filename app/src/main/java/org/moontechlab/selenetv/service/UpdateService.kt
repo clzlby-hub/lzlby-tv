@@ -34,15 +34,9 @@ object UpdateService {
         }.getOrNull() ?: ""
 
     /**
-     * 检查更新。返回 UpdateInfo，或 null（无更新 / CI 构建中无资产 / 无匹配架构）。
-     * 网络或解析失败抛 ApiException。
+     * 已按需求禁用应用更新检查。
      */
-    fun checkForUpdate(context: Context): UpdateInfo? {
-        val release = fetchLatestRelease()
-        val current = currentVersionName(context)
-        val abis = Build.SUPPORTED_ABIS?.toList() ?: emptyList()
-        return UpdateLogic.buildUpdateInfo(release, current, abis)
-    }
+    fun checkForUpdate(context: Context): UpdateInfo? = null
 
     private fun fetchLatestRelease(): GithubRelease {
         val request = Request.Builder()

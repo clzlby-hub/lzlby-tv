@@ -50,6 +50,7 @@ import org.moontechlab.selenetv.service.DoubanCacheService
 import org.moontechlab.selenetv.service.SearchCacheService
 import org.moontechlab.selenetv.service.SubscriptionService
 import org.moontechlab.selenetv.service.UpdateService
+import org.moontechlab.selenetv.util.NetworkUtils
 import qrcode.QRCode
 import java.net.NetworkInterface
 import org.moontechlab.selenetv.ui.AnimatedSelectDialog
@@ -70,33 +71,9 @@ private val RoleBadgeUser = Color(0xFF2ECC71)  // 用户 - 绿色
 private val CacheButtonBgFocused = Color(0xFFF39C12) // 缓存行聚焦填充：实色橙黄
 private val LogoutButtonBgFocused = Color(0xFFE74C3C) // 退出登录聚焦填充：实色红
 
-/**
- * 获取设备所有 IPv4 地址（除回环 IP）
- */
-private fun getAllIpAddresses(): List<String> {
-    val allIps = mutableListOf<String>()
-    try {
-        NetworkInterface.getNetworkInterfaces()?.toList()?.forEach { networkInterface ->
-            if (networkInterface.isUp && !networkInterface.isLoopback) {
-                networkInterface.inetAddresses?.toList()?.forEach { address ->
-                    if (!address.isLoopbackAddress && address.hostAddress?.contains('.') == true) {
-                        address.hostAddress?.let { allIps.add(it) }
-                    }
-                }
-            }
-        }
-    } catch (_: Exception) {}
-    return allIps
-}
+private fun getAllIpAddresses(): List<String> = NetworkUtils.getAllIpAddresses()
 
-/**
- * 获取设备所有 IPv4 地址，优先返回 192.168.x.x 网段
- */
-private fun getPreferredIpAddress(): String? {
-    val allIps = getAllIpAddresses()
-    // 优先选择 192.168.x.x 网段
-    return allIps.find { it.startsWith("192.168.") } ?: allIps.firstOrNull()
-}
+private fun getPreferredIpAddress(): String? = NetworkUtils.getPreferredIpAddress()
 
 @Composable
 fun SettingsTab(
@@ -469,29 +446,11 @@ fun SettingsTab(
                 // —— 关于 ——
                 SectionLabel("关于")
                 SettingRow(
-                    label = "检查更新",
-                    value = if (checkingUpdate) "检查中…" else null,
+                    label = "当前版本",
+                    value = "v${UpdateService.currentVersionName(context)}",
                     showDivider = false,
                     onClick = {
-                        if (checkingUpdate) return@SettingRow
-                        checkingUpdate = true
-                        coroutineScope.launch {
-                            val result = withContext(Dispatchers.IO) {
-                                runCatching { UpdateService.checkForUpdate(context) }
-                            }
-                            checkingUpdate = false
-                            result.fold(
-                                onSuccess = { info ->
-                                    if (info != null) {
-                                        manualUpdateInfo = info
-                                        showManualUpdateDialog = true
-                                    } else {
-                                        org.moontechlab.selenetv.ui.MoonToast.show("已是最新版本")
-                                    }
-                                },
-                                onFailure = { org.moontechlab.selenetv.ui.MoonToast.show("检查更新失败") },
-                            )
-                        }
+                        org.moontechlab.selenetv.ui.MoonToast.show("已是最新版本")
                     },
                     modifier = Modifier.focusRequester(checkUpdateFocusRequester),
                 )
@@ -866,8 +825,8 @@ fun SettingsTab(
         onClosed = { try { subscriptionUrlFocusRequester.requestFocus() } catch (_: Exception) {} },
     ) { onClose ->
         TextInputDialogContent(
-            title = "订阅链接",
-            placeholder = "请输入订阅链接",
+            title = "订阅链接或本地文件路径",
+            placeholder = "http(s):// 或 /sdcard/... 或 file://",
             initialValue = subscriptionUrl,
             onConfirm = { newUrl ->
                 val trimmed = newUrl.trim()
@@ -1454,10 +1413,16 @@ private fun RemoteControlQrCode(
 
         // 标题
         Text(
-            text = "Web 遥控器",
+            text = "Web 遥控器与手机传输",
             fontSize = 18.sp,
             fontWeight = FontWeight.Bold,
             color = TextDefault
+        )
+        Spacer(modifier = Modifier.height(4.dp))
+        Text(
+            text = "扫码手机遥控或直接传输订阅配置",
+            fontSize = 12.sp,
+            color = TextGray
         )
 
         Spacer(modifier = Modifier.height(16.dp))

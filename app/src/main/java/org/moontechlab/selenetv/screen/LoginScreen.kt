@@ -55,6 +55,7 @@ import android.util.Log
 import org.moontechlab.selenetv.service.SubscriptionService
 import org.moontechlab.selenetv.ui.AnimatedSelectDialog
 import org.moontechlab.selenetv.ui.ConfirmDialogContent
+import org.moontechlab.selenetv.util.NetworkUtils
 
 private const val TAG = "LoginScreen"
 
@@ -339,10 +340,10 @@ private fun LoginScreenContent(
                 Spacer(modifier = Modifier.height(24.dp))
 
                 LoginTextField(
-                    label = "订阅链接",
+                    label = "订阅链接或本地路径",
                     value = subscriptionUrl,
                     onValueChange = { subscriptionUrl = it },
-                    placeholder = "例如: https://example.com/sub/xxx",
+                    placeholder = "https://... 或 /sdcard/... 或 file://",
                     focusRequester = subscriptionUrlFocusRequester,
                     downFocusRequester = localLoginButtonFocusRequester,
                 )
@@ -621,8 +622,7 @@ private fun LoginQrCodeSection(
     LaunchedEffect(Unit) {
         withContext(Dispatchers.IO) {
             try {
-                val ips = getAllIpAddresses()
-                val ip = ips.find { it.startsWith("192.168.") } ?: ips.firstOrNull()
+                val ip = NetworkUtils.getPreferredIpAddress()
                 val port = RemoteControlServer.getPort()
                 if (ip != null) {
                     val url = "http://$ip:$port/remote_control"

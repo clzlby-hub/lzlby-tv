@@ -84,4 +84,45 @@ class SubscriptionServiceTest {
         assertEquals(1, parsed.searchResources.size)
         assertEquals(0, parsed.liveSources.size)
     }
+
+    @Test fun parses_tvbox_sites_array() {
+        val payload = """
+            {
+              "sites": [
+                {"key": "site1", "name": "TVBox站点1", "api": "https://api1.com/provide/vod"},
+                {"key": "site2", "name": "TVBox站点2", "api": "https://api2.com/provide/vod"}
+              ],
+              "lives": [
+                {"key": "live1", "name": "央视高清", "url": "https://live.com/cctv.m3u8"}
+              ]
+            }
+        """.trimIndent()
+        val parsed = SubscriptionService.parseSubscriptionJson(payload)
+        assertEquals(2, parsed.searchResources.size)
+        assertEquals(1, parsed.liveSources.size)
+        assertEquals("TVBox站点1", parsed.searchResources[0].name)
+        assertEquals("央视高清", parsed.liveSources[0].name)
+    }
+
+    @Test fun parses_local_file_content() {
+        val tempFile = java.io.File.createTempFile("test_sub_", ".json")
+        try {
+            tempFile.writeText("""
+                {
+                  "api_site": {
+                    "local1": {"name": "本地源1", "api": "https://local.api/vod"}
+                  }
+                }
+            """.trimIndent())
+            val parsed = SubscriptionService.fetchAndParse(tempFile.absolutePath)
+            assertEquals(1, parsed.searchResources.size)
+            assertEquals("本地源1", parsed.searchResources[0].name)
+
+            val parsedFileUri = SubscriptionService.fetchAndParse("file://${tempFile.absolutePath}")
+            assertEquals(1, parsedFileUri.searchResources.size)
+            assertEquals("本地源1", parsedFileUri.searchResources[0].name)
+        } finally {
+            tempFile.delete()
+        }
+    }
 }

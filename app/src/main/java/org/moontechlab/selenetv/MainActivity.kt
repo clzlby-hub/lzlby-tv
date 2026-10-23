@@ -18,6 +18,7 @@ import org.moontechlab.selenetv.screen.AppNavHost
 import org.moontechlab.selenetv.server.RemoteControlServer
 import org.moontechlab.selenetv.service.AppDataService
 import org.moontechlab.selenetv.service.AuthHelper
+import org.moontechlab.selenetv.service.SubscriptionService
 
 private const val TAG = "MainActivity"
 
@@ -79,6 +80,44 @@ class MainActivity : ComponentActivity() {
                     if (focusedView != null) {
                         val inputConnection = focusedView.onCreateInputConnection(android.view.inputmethod.EditorInfo())
                         inputConnection?.commitText(text, 1)
+                    }
+                }
+            }
+        }
+
+        // 设置手机传输/订阅推送回调
+        RemoteControlServer.setSubscriptionCallback { payload ->
+            activityScope.launch(Dispatchers.IO) {
+                try {
+                    val trimmed = payload.trim()
+                    val parsed = if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+                        SubscriptionService.parseSubscriptionJson(trimmed)
+                    } else {
+                        SubscriptionService.fetchAndParse(trimmed)
+                    }
+                    val urlToSave = if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+                        val subFile = java.io.File(filesDir, "subscriptions/remote_pushed.json")
+                        subFile.parentFile?.mkdirs()
+                        subFile.writeText(trimmed, Charsets.UTF_8)
+                        subFile.absolutePath
+                    } else {
+                        trimmed
+                    }
+                    org.moontechlab.selenetv.data.local.LocalStore.saveSubscriptionUrl(urlToSave)
+                    org.moontechlab.selenetv.data.local.LocalStore.saveSubscriptionSources(
+                        parsed.searchResources,
+                        parsed.liveSources,
+                    )
+                    AppDataService.saveIsLocalMode(true)
+                    org.moontechlab.selenetv.service.LiveService.clearAllCache()
+                    withContext(Dispatchers.Main) {
+                        org.moontechlab.selenetv.ui.MoonToast.show(
+                            "手机传输订阅成功！\n搜索源: ${parsed.searchResources.size}，直播源: ${parsed.liveSources.size}"
+                        )
+                    }
+                } catch (e: Exception) {
+                    withContext(Dispatchers.Main) {
+                        org.moontechlab.selenetv.ui.MoonToast.show("加载手机传输订阅失败: ${e.message}")
                     }
                 }
             }

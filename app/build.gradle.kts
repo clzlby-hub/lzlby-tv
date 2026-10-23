@@ -125,10 +125,7 @@ dependencies {
     implementation(libs.androidx.profileinstaller)
     baselineProfile(project(":baselineprofile"))
 
-    // Ktor Server
-    implementation("io.ktor:ktor-server-core:2.3.12")
-    implementation("io.ktor:ktor-server-netty:2.3.12")
-    implementation("io.ktor:ktor-server-html-builder:2.3.12")
+    // Native HTTP Server (No Ktor required)
     
     // QRCode
     implementation("io.github.g0dkar:qrcode-kotlin:4.2.0")
