@@ -44,6 +44,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.onSubscription
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -269,24 +270,22 @@ fun DetailScreen(entry: DetailEntry, onBack: () -> Unit, onGoToSearch: (String) 
         ensureActive()
         when (resp) {
             is ApiResponse.Success -> {
+                // 立即完成加载，让详情页秒开，不被海外 TMDB 网络阻塞
+                state = state.copy(details = resp.data, detailsLoading = false)
                 val q = tmdbQueryTitle(resp.data.originalTitle, resp.data.title)
                 if (q != null) {
-                    // 加载页背后解析 TMDB 剧照（成功/失败/超时/未配 key 都接受），与豆瓣详情同帧落定
                     val key = AppDataService.getTmdbApiKey()
-                    val art = if (key.isNotBlank()) {
-                        kotlinx.coroutines.withTimeoutOrNull(4000) {
+                    if (key.isNotBlank()) {
+                        val art = kotlinx.coroutines.withTimeoutOrNull(2000) {
                             TmdbService.resolveArt(q, resp.data.year, key, doubanCacheService)
                         }
-                    } else null
-                    val ref = if (key.isNotBlank()) {
-                        kotlinx.coroutines.withTimeoutOrNull(4000) {
+                        val ref = kotlinx.coroutines.withTimeoutOrNull(2000) {
                             TmdbService.resolveMediaRef(q, resp.data.year, key, doubanCacheService)
                         }
-                    } else null
-                    ensureActive()
-                    state = state.copy(details = resp.data, tmdbArt = art, tmdbRef = ref, detailsLoading = false)
-                } else {
-                    state = state.copy(details = resp.data, detailsLoading = false)
+                        if (isActive && (art != null || ref != null)) {
+                            state = state.copy(tmdbArt = art, tmdbRef = ref)
+                        }
+                    }
                 }
             }
             is ApiResponse.Error -> state = state.copy(details = null, detailsLoading = false) // 失败兜底源信息
@@ -298,18 +297,19 @@ fun DetailScreen(entry: DetailEntry, onBack: () -> Unit, onGoToSearch: (String) 
     //    Douban 入口 effect 按稳定的 entry 单次运行、不重置 tmdbTrigger，故无 tier2 路径那种抖动竞态。
     LaunchedEffect(tmdbTrigger) {
         val q = tmdbTrigger ?: return@LaunchedEffect
+        state = state.copy(detailsLoading = false)
         val key = AppDataService.getTmdbApiKey()
-        val art = if (key.isNotBlank()) {
-            kotlinx.coroutines.withTimeoutOrNull(4000) {
+        if (key.isNotBlank()) {
+            val art = kotlinx.coroutines.withTimeoutOrNull(2000) {
                 TmdbService.resolveArt(q.originalTitle, q.year, key, doubanCacheService)
             }
-        } else null
-        val ref = if (key.isNotBlank()) {
-            kotlinx.coroutines.withTimeoutOrNull(4000) {
+            val ref = kotlinx.coroutines.withTimeoutOrNull(2000) {
                 TmdbService.resolveMediaRef(q.originalTitle, q.year, key, doubanCacheService)
             }
-        } else null
-        state = state.copy(tmdbArt = art, tmdbRef = ref, detailsLoading = false)
+            if (isActive && (art != null || ref != null)) {
+                state = state.copy(tmdbArt = art, tmdbRef = ref)
+            }
+        }
     }
 
     // 拉播放记录

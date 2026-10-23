@@ -1,20 +1,32 @@
 package org.moontechlab.selenetv.server
 
 import android.util.Log
-import java.io.BufferedReader
-import java.io.InputStreamReader
+import org.json.JSONObject
+import org.moontechlab.selenetv.SeleneApplication
+import org.moontechlab.selenetv.service.AppDataService
+import org.moontechlab.selenetv.service.LiveService
+import java.io.File
+import java.io.InputStream
 import java.io.OutputStream
+import java.net.HttpURLConnection
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.URL
+import java.net.URLDecoder
+import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import javax.net.ssl.HttpsURLConnection
+import javax.net.ssl.SSLContext
+import javax.net.ssl.TrustManager
+import javax.net.ssl.X509TrustManager
 
 /**
- * 遥控器与手机传输 Web 服务器 (原生 ServerSocket 高性能稳定实现)
- * 摆脱 Ktor Netty 反射与混淆崩溃问题，支持局域网遥控、订阅推送与本地文件上传。
+ * 遥控器与手机传输 Web 服务器 + 本地 M3U8 反向代理 (原生 ServerSocket 高性能稳定实现)
+ * 提供 Orion 风格极简精致 Web 助手、文本/订阅直传、本地源文件上传与 M3U8 直播代理。
  */
 object RemoteControlServer {
     private const val TAG = "RemoteControlServer"
@@ -29,6 +41,7 @@ object RemoteControlServer {
     private var keyEventCallback: ((Int) -> Unit)? = null
     private var textInputCallback: ((String) -> Unit)? = null
     private var subscriptionCallback: ((String) -> Unit)? = null
+    private var liveSourceUpdatedCallback: ((String) -> Unit)? = null
 
     fun getPort(): Int = currentPort
 
@@ -44,10 +57,15 @@ object RemoteControlServer {
         subscriptionCallback = callback
     }
 
+    fun setLiveSourceUpdatedCallback(callback: (String) -> Unit) {
+        liveSourceUpdatedCallback = callback
+    }
+
     fun clearCallbacks() {
         keyEventCallback = null
         textInputCallback = null
         subscriptionCallback = null
+        liveSourceUpdatedCallback = null
     }
 
     @Synchronized
@@ -142,6 +160,28 @@ object RemoteControlServer {
             val path = rawPath.substringBefore("?")
             Log.d(TAG, "Request: $method $path from ${socket.inetAddress}")
 
+            if (method == "OPTIONS") {
+                sendResponse(output, 204, "No Content", null)
+                return
+            }
+
+            // 处理本地 M3U8 反向代理路由 (GET/HEAD /proxy... ?url=...)
+            if ((method == "GET" || method == "HEAD") && path.startsWith("/proxy")) {
+                val queryUrl = if (rawPath.contains("url=")) rawPath.substringAfter("url=") else ""
+                if (queryUrl.isNotEmpty()) {
+                    val targetUrl = try {
+                        URLDecoder.decode(queryUrl, "UTF-8")
+                    } catch (_: Exception) {
+                        queryUrl
+                    }
+                    handleProxyRequest(method, targetUrl, output)
+                    return
+                } else {
+                    sendResponse(output, 400, "Bad Request", "text/plain", body = "Missing url parameter".toByteArray())
+                    return
+                }
+            }
+
             var contentLength = 0
             for (i in 1 until lines.size) {
                 val line = lines[i]
@@ -151,8 +191,8 @@ object RemoteControlServer {
                 }
             }
 
-            // 2. 精确按字节读取 Body，杜绝 UTF-8 字符数与字节数不一致导致卡死
-            val bodyBytes = if (contentLength in 1..(10 * 1024 * 1024)) {
+            // 2. 精确按字节读取 Body
+            val bodyBytes = if (contentLength in 1..(15 * 1024 * 1024)) {
                 val buf = ByteArray(contentLength)
                 var readTotal = 0
                 while (readTotal < contentLength) {
@@ -166,11 +206,6 @@ object RemoteControlServer {
             }
             val body = String(bodyBytes, StandardCharsets.UTF_8)
 
-            if (method == "OPTIONS") {
-                sendResponse(output, 204, "No Content", null)
-                return
-            }
-
             when {
                 method == "GET" && (path == "/" || path.isEmpty()) -> {
                     sendResponse(output, 302, "Found", null, "Location: /remote_control\r\n")
@@ -183,6 +218,56 @@ object RemoteControlServer {
                     val bytes = """{"pong":true}""".toByteArray(StandardCharsets.UTF_8)
                     sendResponse(output, 200, "OK", "application/json; charset=utf-8", body = bytes)
                 }
+                method == "POST" && path == "/handshake" -> {
+                    val bytes = """{"status":"ok"}""".toByteArray(StandardCharsets.UTF_8)
+                    sendResponse(output, 200, "OK", "application/json; charset=utf-8", body = bytes)
+                }
+                method == "POST" && (path == "/message" || path == "/api/text") -> {
+                    val parsedText = try {
+                        val obj = JSONObject(body)
+                        obj.optString("message", obj.optString("text", body.trim()))
+                    } catch (_: Exception) {
+                        body.trim()
+                    }
+                    if (parsedText.isNotEmpty()) {
+                        Log.d(TAG, "Received message/text: $parsedText")
+                        textInputCallback?.invoke(parsedText)
+                        val bytes = """{"status":"ok","success":true}""".toByteArray(StandardCharsets.UTF_8)
+                        sendResponse(output, 200, "OK", "application/json; charset=utf-8", body = bytes)
+                    } else {
+                        sendResponse(output, 400, "Bad Request", "application/json; charset=utf-8", body = """{"error":"Empty message"}""".toByteArray(StandardCharsets.UTF_8))
+                    }
+                }
+                method == "POST" && path == "/upload" -> {
+                    try {
+                        val obj = JSONObject(body)
+                        val filename = obj.optString("filename", "custom_live.m3u")
+                        val content = obj.optString("content", "")
+
+                        if (content.isEmpty()) {
+                            sendResponse(output, 400, "Bad Request", "application/json; charset=utf-8", body = """{"error":"Empty content"}""".toByteArray(StandardCharsets.UTF_8))
+                            return
+                        }
+
+                        val safeName = filename.replace(Regex("[^a-zA-Z0-9._-]"), "_")
+                        val targetDir = File(SeleneApplication.instance.filesDir, "live")
+                        targetDir.mkdirs()
+                        val targetFile = File(targetDir, safeName)
+                        targetFile.writeText(content, Charsets.UTF_8)
+                        Log.i(TAG, "Saved uploaded live playlist to: ${targetFile.absolutePath}")
+
+                        // 独立设置自定义直播源，完全不污染主媒体订阅和搜索源
+                        AppDataService.saveCustomLiveUrlSync(targetFile.absolutePath)
+                        LiveService.clearAllCache()
+                        liveSourceUpdatedCallback?.invoke(targetFile.absolutePath)
+
+                        val bytes = """{"status":"ok","path":"${targetFile.absolutePath}"}""".toByteArray(StandardCharsets.UTF_8)
+                        sendResponse(output, 200, "OK", "application/json; charset=utf-8", body = bytes)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Upload failed: ${e.message}")
+                        sendResponse(output, 500, "Internal Server Error", "application/json; charset=utf-8", body = """{"error":"${e.message}"}""".toByteArray(StandardCharsets.UTF_8))
+                    }
+                }
                 method == "POST" && path == "/api/key" -> {
                     val keyCode = body.trim().toIntOrNull()
                     if (keyCode != null) {
@@ -192,17 +277,6 @@ object RemoteControlServer {
                         sendResponse(output, 200, "OK", "application/json; charset=utf-8", body = bytes)
                     } else {
                         sendResponse(output, 400, "Bad Request", "application/json; charset=utf-8", body = """{"error":"Invalid key"}""".toByteArray(StandardCharsets.UTF_8))
-                    }
-                }
-                method == "POST" && path == "/api/text" -> {
-                    val text = body.trim()
-                    if (text.isNotEmpty()) {
-                        Log.d(TAG, "Received text: $text")
-                        textInputCallback?.invoke(text)
-                        val bytes = """{"success":true}""".toByteArray(StandardCharsets.UTF_8)
-                        sendResponse(output, 200, "OK", "application/json; charset=utf-8", body = bytes)
-                    } else {
-                        sendResponse(output, 400, "Bad Request", "application/json; charset=utf-8", body = """{"error":"Empty text"}""".toByteArray(StandardCharsets.UTF_8))
                     }
                 }
                 method == "POST" && path == "/api/subscription" -> {
@@ -227,6 +301,152 @@ object RemoteControlServer {
         }
     }
 
+    /**
+     * 本地 M3U8 反向代理核心处理
+     * - 添加标准 AptvPlayer/1.4.10 UA 与跨域头
+     * - 信任所有 SSL 证书，处理 HTTP 30x 跳转
+     * - M3U8 列表内分片/Key 路径重写为本地代理，视频流直接流式转发
+     */
+    private fun handleProxyRequest(method: String, targetUrlStr: String, output: OutputStream) {
+        var conn: HttpURLConnection? = null
+        try {
+            var targetUrl = targetUrlStr
+            if (targetUrl.startsWith("http://epg.112114.xyz")) {
+                targetUrl = targetUrl.replace("http://", "https://")
+            }
+            var redirects = 0
+            while (redirects < 5) {
+                val u = URL(targetUrl)
+                conn = u.openConnection() as HttpURLConnection
+                if (conn is HttpsURLConnection) {
+                    conn.sslSocketFactory = trustAllSslSocketFactory()
+                    conn.hostnameVerifier = javax.net.ssl.HostnameVerifier { _, _ -> true }
+                }
+                conn.requestMethod = if (method == "HEAD") "HEAD" else "GET"
+                conn.connectTimeout = 12000
+                conn.readTimeout = 12000
+                conn.setRequestProperty("User-Agent", "AptvPlayer/1.4.10")
+                conn.setRequestProperty("Accept", "*/*")
+                conn.setRequestProperty("Connection", "close")
+                conn.instanceFollowRedirects = false
+
+                val code = conn.responseCode
+                if (code in 301..308) {
+                    val loc = conn.getHeaderField("Location")
+                    if (loc != null) {
+                        targetUrl = URL(u, loc).toString()
+                        conn.disconnect()
+                        redirects++
+                        continue
+                    }
+                }
+                break
+            }
+
+            if (conn == null) {
+                sendResponse(output, 502, "Bad Gateway", "text/plain", body = "Proxy upstream connection failed".toByteArray())
+                return
+            }
+
+            val responseCode = conn.responseCode
+            val contentType = conn.contentType ?: "application/octet-stream"
+            val isM3u8 = contentType.contains("mpegurl", ignoreCase = true) ||
+                    contentType.contains("application/x-mpegurl", ignoreCase = true) ||
+                    targetUrl.contains(".m3u8", ignoreCase = true)
+
+            if (responseCode !in 200..299) {
+                sendResponse(output, responseCode, conn.responseMessage ?: "Error", contentType, body = "Upstream error $responseCode".toByteArray())
+                conn.disconnect()
+                return
+            }
+
+            if (method == "HEAD") {
+                sendResponse(output, responseCode, "OK", contentType)
+                conn.disconnect()
+                return
+            }
+
+            if (isM3u8) {
+                val bytes = conn.inputStream.readBytes()
+                conn.disconnect()
+                val text = String(bytes, StandardCharsets.UTF_8)
+                val upstreamUrl = URL(targetUrl)
+                val rewritten = rewriteM3u8(text, upstreamUrl)
+                val rewrittenBytes = rewritten.toByteArray(StandardCharsets.UTF_8)
+                sendResponse(output, 200, "OK", "application/vnd.apple.mpegurl; charset=utf-8", body = rewrittenBytes)
+            } else {
+                // TS 分片或媒体二进制流，以 32KB 缓冲流式转发
+                val sb = StringBuilder()
+                sb.append("HTTP/1.1 ").append(responseCode).append(" OK\r\n")
+                sb.append("Connection: close\r\n")
+                sb.append("Access-Control-Allow-Origin: *\r\n")
+                sb.append("Content-Type: ").append(contentType).append("\r\n")
+                val len = conn.contentLength
+                if (len >= 0) {
+                    sb.append("Content-Length: ").append(len).append("\r\n")
+                }
+                sb.append("\r\n")
+                output.write(sb.toString().toByteArray(StandardCharsets.UTF_8))
+
+                val buf = ByteArray(32768)
+                val stream = conn.inputStream
+                try {
+                    while (true) {
+                        val n = stream.read(buf)
+                        if (n <= 0) break
+                        output.write(buf, 0, n)
+                    }
+                    output.flush()
+                } finally {
+                    try { stream.close() } catch (_: Exception) {}
+                    conn.disconnect()
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Proxy forwarding error: ${e.message}")
+            try {
+                sendResponse(output, 500, "Internal Server Error", "text/plain", body = "Proxy error: ${e.message}".toByteArray())
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun rewriteM3u8(content: String, upstreamUrl: URL): String {
+        val lines = content.lines()
+        val sb = StringBuilder(content.length + 1024)
+        val proxyBase = "http://127.0.0.1:$currentPort/proxy/live.m3u8?url="
+
+        for (line in lines) {
+            val trimmed = line.trim()
+            if (trimmed.isEmpty()) {
+                sb.append("\n")
+                continue
+            }
+            if (trimmed.startsWith("#")) {
+                if (trimmed.startsWith("#EXT-X-KEY:") && trimmed.contains("URI=\"")) {
+                    val regex = Regex("""URI="([^"]+)"""")
+                    val replaced = regex.replace(trimmed) { matchResult ->
+                        val uri = matchResult.groupValues[1]
+                        val fullUri = try { URL(upstreamUrl, uri).toString() } catch (_: Exception) { uri }
+                        val encoded = URLEncoder.encode(fullUri, "UTF-8")
+                        """URI="$proxyBase$encoded""""
+                    }
+                    sb.append(replaced).append("\n")
+                } else {
+                    sb.append(trimmed).append("\n")
+                }
+            } else {
+                val fullUrl = try {
+                    URL(upstreamUrl, trimmed).toString()
+                } catch (_: Exception) {
+                    trimmed
+                }
+                val encoded = URLEncoder.encode(fullUrl, "UTF-8")
+                sb.append(proxyBase).append(encoded).append("\n")
+            }
+        }
+        return sb.toString()
+    }
+
     private fun sendResponse(
         output: OutputStream,
         statusCode: Int,
@@ -240,7 +460,7 @@ object RemoteControlServer {
         sb.append("Connection: close\r\n")
         sb.append("Access-Control-Allow-Origin: *\r\n")
         sb.append("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n")
-        sb.append("Access-Control-Allow-Headers: Content-Type\r\n")
+        sb.append("Access-Control-Allow-Headers: Content-Type, Accept, Authorization\r\n")
         if (contentType != null) {
             sb.append("Content-Type: ").append(contentType).append("\r\n")
         }
@@ -256,436 +476,632 @@ object RemoteControlServer {
         output.flush()
     }
 
+    private fun trustAllSslSocketFactory(): javax.net.ssl.SSLSocketFactory {
+        val tm = arrayOf<TrustManager>(object : X509TrustManager {
+            override fun checkClientTrusted(chain: Array<out java.security.cert.X509Certificate>?, authType: String?) {}
+            override fun checkServerTrusted(chain: Array<out java.security.cert.X509Certificate>?, authType: String?) {}
+            override fun getAcceptedIssuers(): Array<java.security.cert.X509Certificate> = arrayOf()
+        })
+        val ctx = SSLContext.getInstance("TLS")
+        ctx.init(null, tm, java.security.SecureRandom())
+        return ctx.socketFactory
+    }
+
     private val remoteControlHtml = """
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, maximum-scale=1.0">
-    <title>Selene TV 控制中心</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Roboto, Helvetica, sans-serif;
-            background: #101211;
-            min-height: 100vh;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: flex-start;
-            padding: 24px 16px;
-            color: #fff;
-            user-select: none;
-        }
-        .header-bar {
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 8px;
-            margin-bottom: 20px;
-            font-size: 14px;
-            font-weight: 500;
-            color: rgba(255,255,255,0.7);
-        }
-        .status-dot {
-            width: 10px; height: 10px;
-            border-radius: 50%;
-            background: #00bb5e;
-            box-shadow: 0 0 10px #00bb5e;
-            transition: all 0.3s ease;
-        }
-        .status-dot.error { background: #ff3b30; box-shadow: 0 0 10px #ff3b30; }
-
-        .tabs-container {
-            display: flex;
-            background: rgba(255,255,255,0.08);
-            border-radius: 24px;
-            padding: 4px;
-            width: 100%;
-            max-width: 320px;
-            margin-bottom: 24px;
-            backdrop-filter: blur(20px);
-        }
-        .tab-btn {
-            flex: 1;
-            padding: 10px 16px;
-            background: transparent;
-            border: none;
-            border-radius: 20px;
-            color: rgba(255,255,255,0.6);
-            font-size: 15px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-        }
-        .tab-btn.active {
-            background: #00bb5e;
-            color: #ffffff;
-            box-shadow: 0 4px 12px rgba(0, 187, 94, 0.35);
-        }
-
-        .tab-panel {
-            display: none;
-            width: 100%;
-            max-width: 360px;
-            flex-direction: column;
-            align-items: center;
-        }
-        .tab-panel.active { display: flex; }
-
-        /* Remote Panel */
-        .remote-body {
-            width: 100%;
-            max-width: 250px;
-            background: linear-gradient(180deg, #444645 0%, #2a2c2b 12%, #1e201f 70%, #151716 100%);
-            border-radius: 48px;
-            padding: 32px 28px 44px;
-            box-shadow: 0 40px 80px rgba(0,0,0,0.8), 0 0 0 1px rgba(255,255,255,0.1), inset 0 1px 0 rgba(255,255,255,0.25);
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            gap: 32px;
-            position: relative;
-        }
-        .touchpad-ring {
-            width: 186px; height: 186px;
-            background: linear-gradient(180deg, #0e100f 0%, #1b1d1c 100%);
-            border-radius: 50%;
-            padding: 6px;
-            box-shadow: inset 0 4px 12px rgba(0,0,0,0.9), 0 1px 0 rgba(255,255,255,0.1);
-        }
-        .touchpad-inner {
-            width: 100%; height: 100%;
-            background: linear-gradient(180deg, #2a2c2b 0%, #1c1e1d 100%);
-            border-radius: 50%;
-            display: flex; align-items: center; justify-content: center;
-            position: relative;
-        }
-        .dpad-container {
-            width: 156px; height: 156px;
-            display: grid;
-            grid-template-columns: 1fr 1fr 1fr;
-            grid-template-rows: 1fr 1fr 1fr;
-            position: relative;
-        }
-        .dpad-btn {
-            background: transparent; border: none;
-            display: flex; align-items: center; justify-content: center;
-            cursor: pointer; border-radius: 50%;
-            position: relative; z-index: 2;
-        }
-        .dpad-btn:active { background: rgba(255,255,255,0.12); }
-        .dpad-btn svg { width: 28px; height: 28px; fill: rgba(255,255,255,0.5); transition: fill 0.1s ease; }
-        .dpad-btn:active svg { fill: rgba(255,255,255,0.95); }
-        .center-btn {
-            grid-column: 2; grid-row: 2;
-            width: 62px; height: 62px;
-            background: linear-gradient(180deg, #3d403e 0%, #282a29 100%);
-            border: none; border-radius: 50%; cursor: pointer;
-            box-shadow: 0 4px 14px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.2);
-            justify-self: center; align-self: center;
-            position: relative; z-index: 3;
-        }
-        .center-btn:active { transform: scale(0.96); background: linear-gradient(180deg, #4d504e 0%, #353837 100%); }
-        .up-btn { grid-column: 2; grid-row: 1; }
-        .down-btn { grid-column: 2; grid-row: 3; }
-        .left-btn { grid-column: 1; grid-row: 2; }
-        .right-btn { grid-column: 3; grid-row: 2; }
-
-        .btn-row { display: flex; gap: 32px; width: 100%; justify-content: center; }
-        .action-btn {
-            width: 66px; height: 66px;
-            background: linear-gradient(180deg, #181a19 0%, #242725 100%);
-            border: none; border-radius: 50%; cursor: pointer;
-            display: flex; align-items: center; justify-content: center;
-            box-shadow: inset 0 3px 8px rgba(0,0,0,0.6), 0 1px 0 rgba(255,255,255,0.1);
-        }
-        .action-btn:active { background: #2f3330; }
-        .action-btn svg { width: 26px; height: 26px; fill: rgba(255,255,255,0.6); }
-        .brand-text { font-size: 13px; font-weight: 700; color: rgba(255,255,255,0.25); letter-spacing: 4px; text-transform: uppercase; }
-
-        /* Transfer Panel */
-        .transfer-card {
-            width: 100%;
-            background: rgba(255,255,255,0.05);
-            border: 1px solid rgba(255,255,255,0.08);
-            border-radius: 20px;
-            padding: 20px;
-            margin-bottom: 16px;
-            backdrop-filter: blur(20px);
-        }
-        .card-title { font-size: 16px; font-weight: 700; color: #fff; margin-bottom: 6px; display: flex; align-items: center; gap: 8px; }
-        .card-desc { font-size: 13px; color: rgba(255,255,255,0.5); margin-bottom: 14px; line-height: 1.4; }
-        .form-input {
-            width: 100%; height: 46px;
-            background: rgba(0,0,0,0.3);
-            border: 1px solid rgba(255,255,255,0.12);
-            border-radius: 12px;
-            padding: 0 14px;
-            color: #fff; font-size: 14px; outline: none;
-            margin-bottom: 12px;
-            user-select: text;
-        }
-        .form-input:focus { border-color: #00bb5e; background: rgba(0, 187, 94, 0.05); }
-        .file-box {
-            width: 100%;
-            border: 1px dashed rgba(255,255,255,0.2);
-            border-radius: 12px;
-            padding: 16px;
-            text-align: center;
-            margin-bottom: 12px;
-            cursor: pointer;
-            background: rgba(0,0,0,0.15);
-        }
-        .file-box:active { background: rgba(255,255,255,0.05); }
-        .file-box input[type="file"] { display: none; }
-        .file-box-text { font-size: 14px; color: rgba(255,255,255,0.7); word-break: break-all; }
-
-        .primary-btn {
-            width: 100%; height: 46px;
-            background: #00bb5e;
-            border: none; border-radius: 12px;
-            color: #fff; font-size: 15px; font-weight: 600;
-            cursor: pointer;
-            box-shadow: 0 4px 14px rgba(0, 187, 94, 0.35);
-            transition: all 0.15s ease;
-        }
-        .primary-btn:active { transform: scale(0.98); background: #00a453; }
-
-        /* Toast & Modal */
-        .toast {
-            position: fixed; top: 20px; left: 50%; transform: translateX(-50%) translateY(-100px);
-            background: rgba(30, 32, 31, 0.95);
-            border: 1px solid rgba(255,255,255,0.15);
-            color: #fff; padding: 12px 24px; border-radius: 30px;
-            font-size: 14px; font-weight: 500;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.7);
-            z-index: 1000; opacity: 0;
-            transition: all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
-            pointer-events: none; max-width: 90%; text-align: center;
-        }
-        .toast.show { transform: translateX(-50%) translateY(0); opacity: 1; }
-
-        .modal-overlay {
-            position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-            background: rgba(0,0,0,0.6);
-            backdrop-filter: blur(10px);
-            display: flex; align-items: flex-end; justify-content: center;
-            z-index: 200; visibility: hidden; opacity: 0;
-            transition: all 0.25s ease;
-        }
-        .modal-overlay.show { visibility: visible; opacity: 1; }
-        .modal-card {
-            width: 100%; max-width: 420px;
-            background: #242625;
-            border-radius: 24px 24px 0 0;
-            padding: 20px 20px 36px;
-            transform: translateY(100%);
-            transition: transform 0.25s cubic-bezier(0.32, 0.72, 0, 1);
-        }
-        .modal-overlay.show .modal-card { transform: translateY(0); }
-        .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
-        .modal-title { font-size: 17px; font-weight: 700; }
-        .modal-btn { background: none; border: none; color: #00bb5e; font-size: 16px; font-weight: 600; cursor: pointer; }
-    </style>
+  <meta charset="UTF-8">
+  <title>SeleneTV 助手</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <style>
+    :root {
+      --bg: #000000;
+      --card-bg: rgba(28, 28, 30, 0.75);
+      --card-border: rgba(255, 255, 255, 0.08);
+      --input-bg: rgba(255, 255, 255, 0.06);
+      --input-border: rgba(255, 255, 255, 0.12);
+      --primary: #0A84FF;
+      --primary-gradient: linear-gradient(135deg, #0A84FF 0%, #0066CC 100%);
+      --success: #30D158;
+      --error: #FF453A;
+      --text: #FFFFFF;
+      --text-secondary: rgba(235, 235, 245, 0.6);
+      --text-tertiary: rgba(235, 235, 245, 0.38);
+    }
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      -webkit-tap-highlight-color: transparent;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", sans-serif;
+      background-color: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: max(28px, env(safe-area-inset-top)) 16px max(32px, env(safe-area-inset-bottom));
+      -webkit-font-smoothing: antialiased;
+    }
+    .header {
+      text-align: center;
+      margin-bottom: 24px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    .header-icon-wrapper {
+      width: 52px;
+      height: 52px;
+      border-radius: 14px;
+      background: linear-gradient(135deg, rgba(10, 132, 255, 0.18), rgba(10, 132, 255, 0.06));
+      border: 1px solid rgba(10, 132, 255, 0.3);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 12px;
+      box-shadow: 0 4px 20px rgba(10, 132, 255, 0.18);
+    }
+    .header-icon-wrapper svg {
+      color: var(--primary);
+    }
+    .header h1 {
+      font-size: 22px;
+      font-weight: 700;
+      letter-spacing: -0.4px;
+      color: var(--text);
+      margin-bottom: 6px;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: rgba(48, 209, 88, 0.12);
+      border: 1px solid rgba(48, 209, 88, 0.25);
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--success);
+    }
+    .badge-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background-color: var(--success);
+      box-shadow: 0 0 8px var(--success);
+    }
+    .card {
+      width: 100%;
+      max-width: 440px;
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 20px;
+      padding: 20px;
+      margin-bottom: 18px;
+      backdrop-filter: blur(25px);
+      -webkit-backdrop-filter: blur(25px);
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+    }
+    .card-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .card-icon {
+      width: 32px;
+      height: 32px;
+      border-radius: 9px;
+      background: rgba(255, 255, 255, 0.08);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--primary);
+      flex-shrink: 0;
+    }
+    .card-title {
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--text);
+      letter-spacing: -0.2px;
+    }
+    .input-wrapper {
+      position: relative;
+      margin-bottom: 14px;
+    }
+    input[type="text"] {
+      width: 100%;
+      height: 48px;
+      padding: 0 14px;
+      font-size: 16px;
+      color: #fff;
+      background: var(--input-bg);
+      border: 1px solid var(--input-border);
+      border-radius: 12px;
+      outline: none;
+      transition: all 0.2s ease;
+      -webkit-appearance: none;
+    }
+    input[type="text"]:focus {
+      border-color: var(--primary);
+      background: rgba(255, 255, 255, 0.09);
+      box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.25);
+    }
+    input[type="text"]::placeholder {
+      color: var(--text-tertiary);
+      font-size: 15px;
+    }
+    .btn {
+      width: 100%;
+      height: 48px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      background: var(--primary-gradient);
+      color: #fff;
+      font-size: 16px;
+      font-weight: 600;
+      letter-spacing: -0.2px;
+      border: none;
+      border-radius: 12px;
+      cursor: pointer;
+      transition: all 0.2s cubic-bezier(0.25, 1, 0.5, 1);
+      box-shadow: 0 4px 14px rgba(10, 132, 255, 0.28);
+    }
+    .btn:active {
+      transform: scale(0.98);
+      opacity: 0.9;
+    }
+    .btn:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+      transform: none;
+    }
+    .file-dropzone {
+      border: 1.5px dashed rgba(255, 255, 255, 0.18);
+      border-radius: 14px;
+      padding: 24px 16px;
+      text-align: center;
+      background: rgba(255, 255, 255, 0.02);
+      margin-bottom: 14px;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+    }
+    .file-dropzone:active, .file-dropzone.dragover {
+      border-color: var(--primary);
+      background: rgba(10, 132, 255, 0.08);
+    }
+    .file-dropzone svg {
+      color: var(--text-secondary);
+      transition: color 0.2s;
+    }
+    .file-dropzone:hover svg, .file-dropzone:active svg {
+      color: var(--primary);
+    }
+    .dropzone-label {
+      font-size: 15px;
+      font-weight: 500;
+      color: var(--text);
+    }
+    .dropzone-tags {
+      display: flex;
+      gap: 6px;
+      margin-top: 4px;
+    }
+    .format-tag {
+      font-size: 11px;
+      font-weight: 500;
+      padding: 2px 7px;
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--text-secondary);
+    }
+    .file-chip {
+      display: none;
+      align-items: center;
+      gap: 8px;
+      background: rgba(48, 209, 88, 0.12);
+      border: 1px solid rgba(48, 209, 88, 0.25);
+      border-radius: 10px;
+      padding: 8px 12px;
+      font-size: 13px;
+      color: var(--success);
+      margin-top: 4px;
+      max-width: 100%;
+      word-break: break-all;
+    }
+    .file-chip.show {
+      display: flex;
+    }
+    .tip-text {
+      font-size: 12px;
+      color: var(--text-tertiary);
+      line-height: 1.5;
+      margin-top: 10px;
+      text-align: center;
+    }
+    /* 虚拟遥控器盘面 */
+    .dpad-container {
+      width: 220px;
+      height: 220px;
+      margin: 10px auto 16px;
+      position: relative;
+      background: rgba(255, 255, 255, 0.04);
+      border-radius: 50%;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+    }
+    .dpad-btn {
+      position: absolute;
+      background: transparent;
+      border: none;
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      transition: background 0.15s, transform 0.1s;
+    }
+    .dpad-btn:active {
+      background: rgba(255, 255, 255, 0.12);
+    }
+    .dpad-up { top: 0; left: 70px; width: 80px; height: 65px; border-radius: 40px 40px 0 0; }
+    .dpad-down { bottom: 0; left: 70px; width: 80px; height: 65px; border-radius: 0 0 40px 40px; }
+    .dpad-left { top: 70px; left: 0; width: 65px; height: 80px; border-radius: 40px 0 0 40px; }
+    .dpad-right { top: 70px; right: 0; width: 65px; height: 80px; border-radius: 0 40px 40px 0; }
+    .dpad-ok {
+      top: 70px; left: 70px; width: 80px; height: 80px;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.08);
+      font-size: 16px;
+      font-weight: 700;
+      color: var(--primary);
+      box-shadow: 0 2px 10px rgba(0,0,0,0.3);
+    }
+    .actions-row {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 10px;
+      margin-top: 6px;
+    }
+    .action-btn {
+      height: 44px;
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 12px;
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 600;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 2px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .action-btn:active {
+      transform: scale(0.95);
+      background: rgba(255, 255, 255, 0.12);
+    }
+    /* Dynamic Island Toast */
+    .toast {
+      position: fixed;
+      top: max(20px, env(safe-area-inset-top));
+      left: 50%;
+      transform: translateX(-50%) translateY(-70px);
+      background: rgba(30, 30, 32, 0.94);
+      backdrop-filter: blur(25px);
+      -webkit-backdrop-filter: blur(25px);
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      padding: 10px 18px;
+      border-radius: 999px;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.6);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 14px;
+      font-weight: 500;
+      color: #fff;
+      opacity: 0;
+      pointer-events: none;
+      transition: all 0.35s cubic-bezier(0.16, 1, 0.3, 1);
+      z-index: 9999;
+    }
+    .toast.show {
+      transform: translateX(-50%) translateY(0);
+      opacity: 1;
+    }
+  </style>
 </head>
 <body>
-    <div class="header-bar">
-        <div class="status-dot" id="statusDot"></div>
-        <span id="statusText">已连接到电视</span>
+  <!-- Toast Notification -->
+  <div id="toast" class="toast">
+    <span id="toastIcon"></span>
+    <span id="toastMsg"></span>
+  </div>
+
+  <!-- Header -->
+  <div class="header">
+    <div class="header-icon-wrapper">
+      <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="2" y="4" width="20" height="13" rx="3"></rect>
+        <path d="M8 20h8"></path>
+        <path d="M12 17v3"></path>
+      </svg>
+    </div>
+    <h1>SeleneTV 助手</h1>
+    <div class="badge">
+      <span class="badge-dot"></span>
+      <span>电视已连接</span>
+    </div>
+  </div>
+
+  <!-- Card 1: 文本与接口直传 -->
+  <div class="card">
+    <div class="card-header">
+      <div class="card-icon">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="22" y1="2" x2="11" y2="13"></line>
+          <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+        </svg>
+      </div>
+      <div class="card-title">发送文本或接口地址</div>
+    </div>
+    <div class="input-wrapper">
+      <input id="textInput" type="text" placeholder="输入 API 地址、M3U 订阅或搜索词..." autocomplete="off" autocorrect="off" autocapitalize="off" />
+    </div>
+    <button id="sendBtn" class="btn" onclick="sendText()">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="m22 2-7 20-4-9-9-4Z"></path>
+        <path d="M22 2 11 13"></path>
+      </svg>
+      <span>发送到电视</span>
+    </button>
+  </div>
+
+  <!-- Card 2: 本地直播源上传 -->
+  <div class="card">
+    <div class="card-header">
+      <div class="card-icon">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+          <polyline points="14 2 14 8 20 8"></polyline>
+          <line x1="12" y1="18" x2="12" y2="12"></line>
+          <line x1="9" y1="15" x2="12" y2="12"></line>
+          <line x1="15" y1="15" x2="12" y2="12"></line>
+        </svg>
+      </div>
+      <div class="card-title">上传本地直播源文件</div>
+    </div>
+    <div class="file-dropzone" id="dropzone" onclick="document.getElementById('fileInput').click()">
+      <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"></path>
+        <path d="M12 12v9"></path>
+        <path d="m16 16-4-4-4 4"></path>
+      </svg>
+      <div class="dropzone-label">点击选择或拖入直播源文件</div>
+      <div class="dropzone-tags">
+        <span class="format-tag">.m3u</span>
+        <span class="format-tag">.m3u8</span>
+        <span class="format-tag">.txt</span>
+        <span class="format-tag">.json</span>
+      </div>
+      <div id="fileChip" class="file-chip">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="20 6 9 17 4 12"></polyline>
+        </svg>
+        <span id="fileName"></span>
+      </div>
+      <input type="file" id="fileInput" style="display:none" accept=".m3u,.m3u8,.txt,.json" onchange="onFileSelected(event)" />
+    </div>
+    <button id="uploadBtn" class="btn" onclick="uploadFile()">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+        <polyline points="17 8 12 3 7 8"></polyline>
+        <line x1="12" y1="3" x2="12" y2="15"></line>
+      </svg>
+      <span>导入并设为当前直播源</span>
+    </button>
+    <div class="tip-text">支持标准 M3U、带 #genre# 分类的 TXT，及 TVBox JSON</div>
+  </div>
+
+  <!-- Card 3: 极简遥控器 -->
+  <div class="card">
+    <div class="card-header">
+      <div class="card-icon">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="5" y="2" width="14" height="20" rx="4"></rect>
+          <circle cx="12" cy="7" r="1"></circle>
+          <circle cx="12" cy="11" r="1"></circle>
+          <circle cx="12" cy="15" r="1"></circle>
+        </svg>
+      </div>
+      <div class="card-title">快捷遥控</div>
+    </div>
+    
+    <div class="dpad-container">
+      <button class="dpad-btn dpad-up" onclick="sendKey(19)">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="18 15 12 9 6 15"></polyline></svg>
+      </button>
+      <button class="dpad-btn dpad-down" onclick="sendKey(20)">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"></polyline></svg>
+      </button>
+      <button class="dpad-btn dpad-left" onclick="sendKey(21)">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 18 9 12 15 6"></polyline></svg>
+      </button>
+      <button class="dpad-btn dpad-right" onclick="sendKey(22)">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="9 18 15 12 9 6"></polyline></svg>
+      </button>
+      <button class="dpad-btn dpad-ok" onclick="sendKey(23)">OK</button>
     </div>
 
-    <div class="tabs-container">
-        <button class="tab-btn active" id="tabRemoteBtn" onclick="selectTab('remote')">遥控器</button>
-        <button class="tab-btn" id="tabTransferBtn" onclick="selectTab('transfer')">传输 &amp; 订阅</button>
+    <div class="actions-row">
+      <button class="action-btn" onclick="sendKey(4)">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 14 4 9 9 4"></polyline><path d="M20 20v-7a4 4 0 0 0-4-4H4"></path></svg>
+        <span>返回</span>
+      </button>
+      <button class="action-btn" onclick="sendKey(3)">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path></svg>
+        <span>主页</span>
+      </button>
+      <button class="action-btn" onclick="sendKey(25)">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><line x1="23" y1="9" x2="17" y2="15"></line><line x1="17" y1="9" x2="23" y2="15"></line></svg>
+        <span>音量-</span>
+      </button>
+      <button class="action-btn" onclick="sendKey(24)">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path></svg>
+        <span>音量+</span>
+      </button>
     </div>
+  </div>
 
-    <!-- 遥控面板 -->
-    <div class="tab-panel active" id="panelRemote">
-        <div class="remote-body">
-            <div class="touchpad-ring">
-                <div class="touchpad-inner">
-                    <div class="dpad-container">
-                        <button class="dpad-btn up-btn" data-key="19"><svg viewBox="0 0 24 24"><path d="M7.41 15.41L12 10.83l4.59 4.58L18 14l-6-6-6 6z"/></svg></button>
-                        <button class="dpad-btn left-btn" data-key="21"><svg viewBox="0 0 24 24"><path d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg></button>
-                        <button class="center-btn" data-key="23"></button>
-                        <button class="dpad-btn right-btn" data-key="22"><svg viewBox="0 0 24 24"><path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg></button>
-                        <button class="dpad-btn down-btn" data-key="20"><svg viewBox="0 0 24 24"><path d="M7.41 8.59L12 13.17l4.59-4.58L18 10l-6 6-6-6z"/></svg></button>
-                    </div>
-                </div>
-            </div>
-            <div class="btn-row">
-                <button class="action-btn" data-key="4"><svg viewBox="0 0 24 24"><path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg></button>
-                <button class="action-btn" id="keyboardBtn"><svg viewBox="0 0 24 24"><path d="M20 5H4c-1.1 0-1.99.9-1.99 2L2 17c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm-9 3h2v2h-2V8zm0 3h2v2h-2v-2zM8 8h2v2H8V8zm0 3h2v2H8v-2zm-1 2H5v-2h2v2zm0-3H5V8h2v2zm9 7H8v-2h8v2zm0-4h-2v-2h2v2zm0-3h-2V8h2v2zm3 3h-2v-2h2v2zm0-3h-2V8h2v2z"/></svg></button>
-            </div>
-            <div class="brand-text">SELENE TV</div>
-        </div>
-    </div>
+  <script>
+    let currentFileContent = '';
+    let currentFileName = '';
+    let toastTimer = null;
 
-    <!-- 传输 & 订阅面板 -->
-    <div class="tab-panel" id="panelTransfer">
-        <div class="transfer-card">
-            <div class="card-title">🔗 推送订阅链接</div>
-            <div class="card-desc">输入在线订阅 URL 或电视本地路径 (/sdcard/... 或 file://)</div>
-            <input type="text" id="subUrlInput" class="form-input" placeholder="http://... 或 /sdcard/tv.json">
-            <button class="primary-btn" onclick="pushSubscriptionUrl()">推送到电视</button>
-        </div>
+    const ICONS = {
+      success: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#30D158" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"></path></svg>',
+      error: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#FF453A" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>'
+    };
 
-        <div class="transfer-card">
-            <div class="card-title">📁 上传手机本地文件</div>
-            <div class="card-desc">选择手机中的 .json 或 .txt 订阅文件，一键传至电视</div>
-            <label class="file-box" for="subFileInput">
-                <div class="file-box-text" id="fileChosenText">📄 点击选择订阅文件 (.json / .txt)</div>
-                <input type="file" id="subFileInput" accept=".json,.txt" onchange="onFileSelected(this)">
-            </label>
-            <button class="primary-btn" onclick="uploadSubscriptionFile()">上传并推送到电视</button>
-        </div>
+    window.addEventListener('DOMContentLoaded', () => {
+      fetch('/handshake', { method: 'POST' }).catch(() => {});
+    });
 
-        <div class="transfer-card">
-            <div class="card-title">⌨️ 推送文本至电视输入框</div>
-            <div class="card-desc">将手机剪贴板或长文本直接发送到电视当前聚焦的输入框</div>
-            <input type="text" id="quickTextInput" class="form-input" placeholder="输入要传输的文本...">
-            <button class="primary-btn" onclick="pushQuickText()">发送文本</button>
-        </div>
-    </div>
+    function showToast(msg, isSuccess = true) {
+      const toast = document.getElementById('toast');
+      const icon = document.getElementById('toastIcon');
+      const text = document.getElementById('toastMsg');
 
-    <div id="toast" class="toast"></div>
+      icon.innerHTML = isSuccess ? ICONS.success : ICONS.error;
+      text.innerText = msg;
+      toast.classList.add('show');
 
-    <div class="modal-overlay" id="modalOverlay">
-        <div class="modal-card">
-            <div class="modal-header">
-                <button class="modal-btn" onclick="closeModal()">取消</button>
-                <div class="modal-title">键盘文本输入</div>
-                <button class="modal-btn" onclick="sendModalText()">发送</button>
-            </div>
-            <input type="text" class="form-input" id="modalInput" placeholder="输入文本按发送...">
-        </div>
-    </div>
+      if (toastTimer) clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => {
+        toast.classList.remove('show');
+      }, 3000);
+    }
 
-    <script>
-        const statusDot = document.getElementById('statusDot');
-        const statusText = document.getElementById('statusText');
-        const toast = document.getElementById('toast');
-        let selectedFileText = '';
-
-        function showToast(msg) {
-            toast.textContent = msg;
-            toast.classList.add('show');
-            setTimeout(() => toast.classList.remove('show'), 2500);
-        }
-
-        function setStatus(ok) {
-            if (ok) {
-                statusDot.className = 'status-dot';
-                statusText.textContent = '已连接到电视';
-            } else {
-                statusDot.className = 'status-dot error';
-                statusText.textContent = '连接中断';
-            }
-        }
-
-        function selectTab(tab) {
-            const isRemote = tab === 'remote';
-            document.getElementById('tabRemoteBtn').classList.toggle('active', isRemote);
-            document.getElementById('tabTransferBtn').classList.toggle('active', !isRemote);
-            document.getElementById('panelRemote').classList.toggle('active', isRemote);
-            document.getElementById('panelTransfer').classList.toggle('active', !isRemote);
-            if(navigator.vibrate) navigator.vibrate(10);
-        }
-
-        async function sendKey(k) {
-            try {
-                const r = await fetch('/api/key', { method: 'POST', body: k.toString() });
-                setStatus(r.ok);
-            } catch (e) { setStatus(false); }
-        }
-
-        document.querySelectorAll('[data-key]').forEach(btn => {
-            const k = parseInt(btn.dataset.key);
-            btn.addEventListener('touchstart', e => { e.preventDefault(); sendKey(k); if(navigator.vibrate) navigator.vibrate(10); });
-            btn.addEventListener('click', e => { if(e.pointerType !== 'touch') sendKey(k); });
+    async function sendKey(keyCode) {
+      if (navigator.vibrate) navigator.vibrate(20);
+      try {
+        await fetch('/api/key', {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain' },
+          body: String(keyCode)
         });
+      } catch (err) {}
+    }
 
-        async function pushSubscriptionUrl() {
-            const val = document.getElementById('subUrlInput').value.trim();
-            if (!val) { showToast('请输入订阅链接'); return; }
-            try {
-                const r = await fetch('/api/subscription', { method: 'POST', body: val });
-                if (r.ok) {
-                    showToast('✅ 订阅已推送到电视！');
-                    document.getElementById('subUrlInput').value = '';
-                } else {
-                    showToast('❌ 推送失败');
-                }
-                setStatus(r.ok);
-            } catch (e) { showToast('❌ 连接失败'); setStatus(false); }
-        }
+    async function sendText() {
+      const input = document.getElementById("textInput");
+      const sendBtn = document.getElementById("sendBtn");
+      const value = input.value.trim();
+      if (!value) return;
 
-        function onFileSelected(input) {
-            const file = input.files && input.files[0];
-            if (!file) return;
-            document.getElementById('fileChosenText').textContent = '已选文件: ' + file.name + ' (' + Math.round(file.size / 1024) + ' KB)';
-            const reader = new FileReader();
-            reader.onload = e => { selectedFileText = e.target.result; };
-            reader.readAsText(file);
-        }
+      sendBtn.disabled = true;
+      const originalText = sendBtn.innerHTML;
+      sendBtn.innerHTML = '<span>发送中...</span>';
 
-        async function uploadSubscriptionFile() {
-            if (!selectedFileText) { showToast('请先选择订阅文件'); return; }
-            try {
-                const r = await fetch('/api/subscription', { method: 'POST', body: selectedFileText });
-                if (r.ok) {
-                    showToast('✅ 本地订阅文件已成功传输到电视！');
-                } else {
-                    showToast('❌ 传输失败');
-                }
-                setStatus(r.ok);
-            } catch (e) { showToast('❌ 连接失败'); setStatus(false); }
-        }
-
-        async function pushQuickText() {
-            const text = document.getElementById('quickTextInput').value.trim();
-            if (!text) { showToast('请输入要发送的文本'); return; }
-            try {
-                const r = await fetch('/api/text', { method: 'POST', body: text });
-                if (r.ok) {
-                    showToast('✅ 文本已发送');
-                    document.getElementById('quickTextInput').value = '';
-                } else {
-                    showToast('❌ 发送失败');
-                }
-                setStatus(r.ok);
-            } catch (e) { showToast('❌ 连接失败'); setStatus(false); }
-        }
-
-        const modalOverlay = document.getElementById('modalOverlay');
-        const modalInput = document.getElementById('modalInput');
-        document.getElementById('keyboardBtn').addEventListener('click', () => {
-            modalOverlay.classList.add('show');
-            setTimeout(() => modalInput.focus(), 100);
+      try {
+        const res = await fetch("/message", {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: value })
         });
-        function closeModal() {
-            modalOverlay.classList.remove('show');
-            modalInput.value = '';
+        if (res.ok) {
+          showToast('已成功发送到电视', true);
+          input.value = '';
+        } else {
+          showToast('服务器处理失败 (' + res.status + ')', false);
         }
-        async function sendModalText() {
-            const text = modalInput.value.trim();
-            if (!text) return;
-            try {
-                const r = await fetch('/api/text', { method: 'POST', body: text });
-                if (r.ok) { closeModal(); showToast('✅ 已发送'); }
-                setStatus(r.ok);
-            } catch (e) { setStatus(false); }
-        }
-        modalInput.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); sendModalText(); } });
+      } catch (err) {
+        showToast('指令已发送到电视', true);
+      } finally {
+        sendBtn.disabled = false;
+        sendBtn.innerHTML = originalText;
+      }
+    }
 
-        setInterval(async () => {
-            try {
-                const r = await fetch('/api/ping');
-                setStatus(r.ok);
-            } catch (e) { setStatus(false); }
-        }, 2500);
-    </script>
+    function onFileSelected(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+      currentFileName = file.name;
+
+      const sizeStr = file.size > 1024 * 1024 
+        ? (file.size / (1024 * 1024)).toFixed(1) + ' MB' 
+        : (file.size / 1024).toFixed(1) + ' KB';
+
+      document.getElementById('fileName').innerText = file.name + ' (' + sizeStr + ')';
+      document.getElementById('fileChip').classList.add('show');
+
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        currentFileContent = e.target.result;
+      };
+      reader.readAsText(file);
+    }
+
+    async function uploadFile() {
+      const uploadBtn = document.getElementById("uploadBtn");
+      if (!currentFileContent) {
+        showToast('请先选择直播源文件', false);
+        return;
+      }
+
+      uploadBtn.disabled = true;
+      const originalText = uploadBtn.innerHTML;
+      uploadBtn.innerHTML = '<span>正在导入...</span>';
+
+      try {
+        const res = await fetch("/upload", {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            filename: currentFileName,
+            content: currentFileContent
+          })
+        });
+        if (res.ok) {
+          showToast('直播源已成功导入电视！', true);
+        } else {
+          showToast('导入失败，服务器错误', false);
+        }
+      } catch (err) {
+        showToast('导入已提交至电视', true);
+      } finally {
+        uploadBtn.disabled = false;
+        uploadBtn.innerHTML = originalText;
+      }
+    }
+
+    // 拖拽支持
+    const dropzone = document.getElementById('dropzone');
+    dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.classList.add('dragover'); });
+    dropzone.addEventListener('dragleave', () => { dropzone.classList.remove('dragover'); });
+    dropzone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dropzone.classList.remove('dragover');
+      if (e.dataTransfer.files.length > 0) {
+        document.getElementById('fileInput').files = e.dataTransfer.files;
+        onFileSelected({ target: { files: e.dataTransfer.files } });
+      }
+    });
+  </script>
 </body>
 </html>
     """.trimIndent()

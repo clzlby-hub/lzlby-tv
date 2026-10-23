@@ -73,6 +73,7 @@ import androidx.tv.material3.Icon
 import androidx.tv.material3.Surface
 import androidx.tv.material3.Text
 import coil.compose.AsyncImage
+import coil.compose.SubcomposeAsyncImage
 import coil.request.ImageRequest
 import org.moontechlab.selenetv.model.LiveChannel
 import org.moontechlab.selenetv.model.LiveChannelGroup
@@ -98,6 +99,15 @@ fun LiveChannelPanel(
     val tabs = remember(groups) { listOf(AllTab) + groups.map { it.name } }
     var selectedTab by remember(tabs) { mutableStateOf(tabs.firstOrNull() ?: AllTab) }
     val contentFocus = remember { FocusRequester() }
+    var focusedChannel by remember { mutableStateOf<LiveChannel?>(null) }
+    var focusedEpg by remember { mutableStateOf<org.moontechlab.selenetv.service.EpgService.ChannelEpg?>(null) }
+
+    LaunchedEffect(focusedChannel) {
+        val ch = focusedChannel
+        if (ch != null) {
+            focusedEpg = org.moontechlab.selenetv.service.EpgService.getChannelEpg(ch.name, ch.tvgId)
+        }
+    }
 
     fun enterContent() {
         try { contentFocus.requestFocus() } catch (_: Exception) {}
@@ -123,18 +133,54 @@ fun LiveChannelPanel(
             )
             .padding(start = 56.dp, end = 56.dp, top = 12.dp, bottom = 14.dp),
     ) {
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            tabs.forEachIndexed { index, tab ->
-                LivePanelTabItem(
-                    label = tab,
-                    selected = tab == selectedTab,
-                    upTarget = osdFocus,
-                    isFirst = index == 0,
-                    isLast = index == tabs.lastIndex,
-                    onEnterContent = ::enterContent,
-                    onFocused = { selectedTab = tab },
-                    modifier = if (tab == selectedTab) Modifier.focusRequester(activeTabFocus) else Modifier,
-                )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.weight(1f, fill = false)) {
+                tabs.forEachIndexed { index, tab ->
+                    LivePanelTabItem(
+                        label = tab,
+                        selected = tab == selectedTab,
+                        upTarget = osdFocus,
+                        isFirst = index == 0,
+                        isLast = index == tabs.lastIndex,
+                        onEnterContent = ::enterContent,
+                        onFocused = { selectedTab = tab },
+                        modifier = if (tab == selectedTab) Modifier.focusRequester(activeTabFocus) else Modifier,
+                    )
+                }
+            }
+
+            // 右侧 EPG 节目预告胶囊
+            val prog = focusedEpg?.currentProgram
+            if (prog != null) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(Color(0xFF242625))
+                        .padding(horizontal = 10.dp, vertical = 4.dp),
+                ) {
+                    Box(modifier = Modifier.size(6.dp).clip(CircleShape).background(LiveAccent))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "正在播出: ${prog.title} (${prog.start}-${prog.stop})",
+                        color = Color.White,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                    )
+                    val nextProg = focusedEpg?.nextProgram
+                    if (nextProg != null) {
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Text(
+                            text = "稍后: ${nextProg.title} (${nextProg.start})",
+                            color = Color(0xFFAAAAAA),
+                            fontSize = 11.sp,
+                        )
+                    }
+                }
             }
         }
 
@@ -156,6 +202,7 @@ fun LiveChannelPanel(
                     currentChannelId = currentChannelId,
                     userAgent = userAgent,
                     onPickChannel = onPickChannel,
+                    onChannelFocused = { focusedChannel = it },
                     contentHeight = contentHeight,
                     firstFocus = if (tab == selectedTab) contentFocus else null,
                     onExitUp = onContentExitUp,
@@ -235,6 +282,7 @@ private fun LiveChannelGrid(
     currentChannelId: String,
     userAgent: String,
     onPickChannel: (LiveChannel) -> Unit,
+    onChannelFocused: (LiveChannel) -> Unit,
     contentHeight: Dp,
     firstFocus: FocusRequester?,
     onExitUp: () -> Unit,
@@ -266,6 +314,7 @@ private fun LiveChannelGrid(
                 heightDp = tileHeight,
                 userAgent = userAgent,
                 onClick = { onPickChannel(channel) },
+                onFocused = { onChannelFocused(channel) },
                 onExitUp = onExitUp,
                 focusRequester = if (index == currentIndex) firstFocus else null,
             )
@@ -282,11 +331,20 @@ private fun LiveChannelTile(
     heightDp: Dp,
     userAgent: String,
     onClick: () -> Unit,
+    onFocused: () -> Unit,
     onExitUp: () -> Unit,
     focusRequester: FocusRequester?,
 ) {
     val context = LocalContext.current
     var focused by remember { mutableStateOf(false) }
+    var tileEpg by remember { mutableStateOf<org.moontechlab.selenetv.service.EpgService.ChannelEpg?>(null) }
+
+    LaunchedEffect(focused) {
+        if (focused) {
+            onFocused()
+            tileEpg = org.moontechlab.selenetv.service.EpgService.getChannelEpg(channel.name, channel.tvgId)
+        }
+    }
     val scale by animateFloatAsState(
         targetValue = if (focused) 1.05f else 1f,
         animationSpec = spring(dampingRatio = 0.6f, stiffness = 400f),
@@ -361,24 +419,27 @@ private fun LiveChannelTile(
                     ),
                 contentAlignment = Alignment.Center,
             ) {
-                if (channel.logo.isNotEmpty()) {
-                    AsyncImage(
+                val effectiveLogo = remember(channel.logo, channel.name) {
+                    org.moontechlab.selenetv.service.LiveService.normalizeLogoUrl(channel.logo, channel.name, channel.tvgId)
+                }
+                if (effectiveLogo.isNotEmpty()) {
+                    SubcomposeAsyncImage(
                         model = ImageRequest.Builder(context)
-                            .data(channel.logo)
-                            .addHeader("User-Agent", userAgent)
+                            .data(effectiveLogo)
                             .crossfade(true)
                             .build(),
                         contentDescription = channel.name,
+                        loading = {
+                            org.moontechlab.selenetv.screen.tab.ChannelLogoFallback(name = channel.name)
+                        },
+                        error = {
+                            org.moontechlab.selenetv.screen.tab.ChannelLogoFallback(name = channel.name)
+                        },
                         modifier = Modifier.fillMaxSize().padding(if (focused) 5.dp else 7.dp),
                         contentScale = ContentScale.Fit,
                     )
                 } else {
-                    Icon(
-                        imageVector = Icons.Default.Tv,
-                        contentDescription = null,
-                        tint = Color(0xFF555555),
-                        modifier = Modifier.size(40.dp),
-                    )
+                    org.moontechlab.selenetv.screen.tab.ChannelLogoFallback(name = channel.name)
                 }
 
                 // 「在看」角标：右上角绿圆点（带深色描边在亮 logo 上也可见），不做成整圈避免冒充焦点环
@@ -394,6 +455,28 @@ private fun LiveChannelTile(
                             .clip(CircleShape)
                             .background(LiveAccent),
                     )
+                }
+
+                // 聚焦时在 logo 底部浮现即时节目名称
+                if (focused && tileEpg?.currentProgram != null) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .fillMaxWidth()
+                            .background(Color(0xE6141414))
+                            .padding(horizontal = 4.dp, vertical = 2.dp),
+                    ) {
+                        Text(
+                            text = tileEpg!!.currentProgram!!.title,
+                            color = LiveAccent,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
                 }
             }
 

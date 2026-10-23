@@ -33,10 +33,16 @@ import org.moontechlab.selenetv.ui.MoonToast
  */
 class SeleneApplication : Application(), ImageLoaderFactory {
 
+    companion object {
+        lateinit var instance: SeleneApplication
+            private set
+    }
+
     private val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     override fun onCreate() {
         super.onCreate()
+        instance = this
         // 初始化 AppDataService
         AppDataService.init(this)
         LocalStore.init(this)
@@ -45,6 +51,16 @@ class SeleneApplication : Application(), ImageLoaderFactory {
         
         // 启动遥控器 Web 服务器
         startRemoteControlServer()
+
+        // 异步预加载节目单 (EPG)
+        applicationScope.launch {
+            try {
+                val epgUrl = AppDataService.getEpgUrlSync()
+                org.moontechlab.selenetv.service.EpgService.init(this@SeleneApplication, epgUrl)
+            } catch (e: Exception) {
+                Log.w("SeleneApplication", "EPG init failed: ${e.message}")
+            }
+        }
 
         // 本地模式启动后台刷新订阅：不阻塞 onCreate，失败仅 toast
         if (AppDataService.isLocalModeSync()) {

@@ -5,6 +5,7 @@ import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.Arrangement
@@ -15,9 +16,14 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.wrapContentHeight
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -29,7 +35,9 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -102,16 +110,35 @@ fun LivePlayerScreen(launch: LiveLaunch, onExit: () -> Unit, modifier: Modifier 
         panelOpen = true
     }
 
+    fun getEffectiveLiveUrl(rawUrl: String): String {
+        val proxy = org.moontechlab.selenetv.service.AppDataService.getM3u8ProxyUrlSync()
+        return if (proxy == "off" || proxy == "direct") {
+            rawUrl
+        } else if (proxy.isNotEmpty() && proxy != "local") {
+            PlayProgress.buildPlayUrl(rawUrl, proxy)
+        } else {
+            val port = org.moontechlab.selenetv.server.RemoteControlServer.getPort()
+            "http://127.0.0.1:$port/proxy/live.m3u8?url=${java.net.URLEncoder.encode(rawUrl, "UTF-8")}"
+        }
+    }
+
+    var currentEpg by remember { mutableStateOf<org.moontechlab.selenetv.service.EpgService.ChannelEpg?>(null) }
+    LaunchedEffect(currentChannel, controlsVisible) {
+        if (controlsVisible || currentEpg == null) {
+            currentEpg = org.moontechlab.selenetv.service.EpgService.getChannelEpg(currentChannel.name, currentChannel.tvgId)
+        }
+    }
+
     fun pickChannel(channel: LiveChannel) {
         currentChannel = channel
         stalled = false
-        controller.load(channel.url, 0)
+        controller.load(getEffectiveLiveUrl(channel.url), 0)
         panelOpen = false
         wake()
     }
 
     LaunchedEffect(Unit) {
-        controller.load(currentChannel.url, 0)
+        controller.load(getEffectiveLiveUrl(currentChannel.url), 0)
     }
 
     LaunchedEffect(Unit) {
@@ -303,16 +330,18 @@ fun LivePlayerScreen(launch: LiveLaunch, onExit: () -> Unit, modifier: Modifier 
                     .background(
                         Brush.verticalGradient(
                             0f to Color.Transparent,
-                            0.5f to Color(0x99000000),
-                            1f to Color(0xCC000000),
+                            0.25f to Color(0x99000000),
+                            1f to Color(0xEE000000),
                         ),
                     )
-                    .padding(start = 56.dp, end = 56.dp, top = 80.dp, bottom = if (panelOpen) 2.dp else 18.dp),
+                    .padding(start = 56.dp, end = 56.dp, top = 36.dp, bottom = if (panelOpen) 2.dp else 18.dp),
             ) {
                 Column {
                     LiveOsd(
                         channelName = currentChannel.name,
+                        epg = currentEpg,
                         controlsVisible = controlsVisible,
+                        panelOpen = panelOpen,
                         focusRequester = osdFocus,
                         // 频道网格「上」回标签栏的中转期间，OSD 可能短暂获焦——此时不收面板。
                         onFocused = { if (!routeContentUpToTab) panelOpen = false },
@@ -368,17 +397,34 @@ fun LivePlayerScreen(launch: LiveLaunch, onExit: () -> Unit, modifier: Modifier 
 @Composable
 private fun LiveOsd(
     channelName: String,
+    epg: org.moontechlab.selenetv.service.EpgService.ChannelEpg?,
     controlsVisible: Boolean,
+    panelOpen: Boolean,
     focusRequester: FocusRequester,
     onFocused: () -> Unit,
     onWake: () -> Unit,
     onToggle: () -> Unit,
     onOpenPanel: () -> Unit,
 ) {
-    Row(
+    val coroutineScope = rememberCoroutineScope()
+    val allPrograms = epg?.allPrograms.orEmpty()
+    val now = System.currentTimeMillis()
+    val currentIndex = remember(allPrograms, epg?.currentProgram) {
+        val idx = allPrograms.indexOfFirst { it == epg?.currentProgram }
+        if (idx >= 0) idx else 0
+    }
+    val listState = rememberLazyListState(initialFirstVisibleItemIndex = (currentIndex - 1).coerceAtLeast(0))
+
+    LaunchedEffect(currentIndex, controlsVisible) {
+        if (allPrograms.isNotEmpty() && currentIndex >= 0) {
+            listState.scrollToItem((currentIndex - 1).coerceAtLeast(0))
+        }
+    }
+
+    Column(
         modifier = Modifier
             .fillMaxWidth()
-            .height(58.dp)
+            .wrapContentHeight()
             .focusRequester(focusRequester)
             .onFocusChanged { if (it.isFocused) onFocused() }
             .focusProperties { up = FocusRequester.Cancel }
@@ -403,6 +449,27 @@ private fun LiveOsd(
                         onOpenPanel()
                         true
                     }
+                    Key.DirectionUp -> {
+                        if (listState.firstVisibleItemIndex > 0) {
+                            coroutineScope.launch { listState.animateScrollToItem((listState.firstVisibleItemIndex - 3).coerceAtLeast(0)) }
+                            onWake()
+                            true
+                        } else false
+                    }
+                    Key.DirectionLeft -> {
+                        if (listState.firstVisibleItemIndex > 0) {
+                            coroutineScope.launch { listState.animateScrollToItem((listState.firstVisibleItemIndex - 4).coerceAtLeast(0)) }
+                            onWake()
+                            true
+                        } else false
+                    }
+                    Key.DirectionRight -> {
+                        if (listState.firstVisibleItemIndex + 3 < allPrograms.size) {
+                            coroutineScope.launch { listState.animateScrollToItem(listState.firstVisibleItemIndex + 4) }
+                            onWake()
+                            true
+                        } else false
+                    }
                     else -> {
                         onWake()
                         false
@@ -410,29 +477,188 @@ private fun LiveOsd(
                 }
             }
             .focusable(),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween,
     ) {
-        Text(
-            text = channelName,
-            color = Color.White,
-            fontSize = 30.sp,
-            fontWeight = FontWeight.W700,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.weight(1f),
-        )
-        Spacer(modifier = Modifier.width(22.dp))
+        // 顶部行：频道名与 LIVE 徽标
         Row(
+            modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            modifier = Modifier
-                .clip(RoundedCornerShape(999.dp))
-                .background(Color.White.copy(alpha = 0.10f))
-                .padding(horizontal = 13.dp, vertical = 7.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
         ) {
-            Box(modifier = Modifier.size(8.dp).clip(CircleShape).background(LiveGreen))
-            Text(text = "LIVE", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.W800)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = channelName,
+                    color = Color.White,
+                    fontSize = 26.sp,
+                    fontWeight = FontWeight.W700,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (allPrograms.isNotEmpty() && !panelOpen) {
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Text(
+                        text = "全天节目单 [◄/►翻看]",
+                        color = Color.White.copy(alpha = 0.45f),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Normal,
+                    )
+                }
+            }
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier
+                    .clip(RoundedCornerShape(999.dp))
+                    .background(Color.White.copy(alpha = 0.10f))
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
+            ) {
+                Box(modifier = Modifier.size(8.dp).clip(CircleShape).background(LiveGreen))
+                Text(text = "LIVE", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.W800)
+            }
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        // 竖项全天节目单区域
+        if (panelOpen) {
+            // 当选台面板展开时，只显示单行当前节目，给频道网格留出充裕空间
+            val prog = epg?.currentProgram
+            if (prog != null) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(modifier = Modifier.size(6.dp).clip(CircleShape).background(LiveGreen))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "正在播出: ${prog.title} (${prog.start}-${prog.stop})",
+                        color = Color.White.copy(alpha = 0.90f),
+                        fontSize = 13.sp,
+                    )
+                }
+            }
+        } else if (allPrograms.isNotEmpty()) {
+            LazyColumn(
+                state = listState,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 168.dp)
+                    .padding(vertical = 2.dp),
+                verticalArrangement = Arrangement.spacedBy(3.dp),
+            ) {
+                itemsIndexed(allPrograms, key = { idx, item -> "$idx-${item.startMs}-${item.title}" }) { index, item ->
+                    val isCurrent = item == epg?.currentProgram || (index == currentIndex && epg?.currentProgram != null)
+                    if (isCurrent) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(6.dp))
+                                .background(Color.White.copy(alpha = 0.09f))
+                                .padding(horizontal = 8.dp, vertical = 3.dp),
+                        ) {
+                            Box(modifier = Modifier.size(7.dp).clip(CircleShape).background(LiveGreen))
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "${item.start} - ${item.stop}",
+                                color = LiveGreen,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.width(96.dp),
+                            )
+                            Text(
+                                text = item.title,
+                                color = Color.White,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f),
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Box(
+                                modifier = Modifier
+                                    .border(1.dp, LiveGreen.copy(alpha = 0.8f), RoundedCornerShape(4.dp))
+                                    .padding(horizontal = 6.dp, vertical = 1.dp),
+                            ) {
+                                Text(
+                                    text = "正在播出",
+                                    color = LiveGreen,
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold,
+                                )
+                            }
+                        }
+                    } else {
+                        val isPast = item.stopMs > 0 && item.stopMs < now
+                        val contentAlpha = if (isPast) 0.38f else 0.82f
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 8.dp, vertical = 2.dp),
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(5.dp)
+                                    .clip(CircleShape)
+                                    .background(Color.White.copy(alpha = if (isPast) 0.22f else 0.45f)),
+                            )
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Text(
+                                text = "${item.start} - ${item.stop}",
+                                color = Color.White.copy(alpha = contentAlpha),
+                                fontSize = 12.sp,
+                                modifier = Modifier.width(96.dp),
+                            )
+                            Text(
+                                text = item.title,
+                                color = Color.White.copy(alpha = contentAlpha),
+                                fontSize = 12.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f),
+                            )
+                        }
+                    }
+                }
+            }
+        } else {
+            // EPG 未就绪或仅有当前/下一节目时的坚挺竖向降级显示
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                val cur = epg?.currentProgram
+                if (cur != null) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(modifier = Modifier.size(6.dp).clip(CircleShape).background(LiveGreen))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "${cur.start} - ${cur.stop}  ${cur.title}",
+                            color = LiveGreen,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Bold,
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(text = "[正在播出]", color = LiveGreen, fontSize = 10.sp)
+                    }
+                }
+                val nxt = epg?.nextProgram
+                if (nxt != null) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(modifier = Modifier.size(5.dp).clip(CircleShape).background(Color.White.copy(alpha = 0.4f)))
+                        Spacer(modifier = Modifier.width(9.dp))
+                        Text(
+                            text = "${nxt.start} - ${nxt.stop}  ${nxt.title}",
+                            color = Color.White.copy(alpha = 0.65f),
+                            fontSize = 12.sp,
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(text = "[稍后]", color = Color.White.copy(alpha = 0.5f), fontSize = 10.sp)
+                    }
+                }
+                if (cur == null && nxt == null) {
+                    Text(
+                        text = "暂无节目单信息",
+                        color = Color.White.copy(alpha = 0.4f),
+                        fontSize = 12.sp,
+                    )
+                }
+            }
         }
     }
 }

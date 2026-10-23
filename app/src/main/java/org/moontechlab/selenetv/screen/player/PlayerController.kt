@@ -101,7 +101,15 @@ class PlayerController(
     override fun load(url: String, startMs: Long, playWhenReady: Boolean) {
         error = null
         hasStarted = false
-        exo.setMediaItem(MediaItem.fromUri(url))
+        val mediaItem = if (url.contains(".m3u8", ignoreCase = true) || url.contains("proxy", ignoreCase = true)) {
+            MediaItem.Builder()
+                .setUri(url)
+                .setMimeType(androidx.media3.common.MimeTypes.APPLICATION_M3U8)
+                .build()
+        } else {
+            MediaItem.fromUri(url)
+        }
+        exo.setMediaItem(mediaItem)
         exo.prepare()
         if (startMs > 0) exo.seekTo(startMs)
         exo.playWhenReady = playWhenReady

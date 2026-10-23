@@ -40,6 +40,7 @@ import androidx.compose.ui.unit.sp
 import androidx.tv.material3.ClickableSurfaceDefaults
 import androidx.tv.material3.Surface
 import androidx.tv.material3.Text
+import org.moontechlab.selenetv.service.LiveService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -100,7 +101,9 @@ fun SettingsTab(
     var bangumiDataSource by remember { mutableStateOf("") }
     var bangumiImageSource by remember { mutableStateOf("") }
     var tmdbApiKey by remember { mutableStateOf("") }
+    var customLiveUrl by remember { mutableStateOf("") }
     var m3u8ProxyUrl by remember { mutableStateOf("") }
+    var epgUrl by remember { mutableStateOf("") }
     var playerType by remember { mutableStateOf("") }
     var decodeMode by remember { mutableStateOf("") }
     var searchOrigin by remember { mutableStateOf("") }
@@ -141,11 +144,18 @@ fun SettingsTab(
     val bangumiDataSourceFocusRequester = remember { FocusRequester() }
     val bangumiImageSourceFocusRequester = remember { FocusRequester() }
     val tmdbApiKeyFocusRequester = remember { FocusRequester() }
+    val customLiveFocusRequester = remember { FocusRequester() }
+    val refreshLiveFocusRequester = remember { FocusRequester() }
     val m3u8ProxyFocusRequester = remember { FocusRequester() }
+    val epgFocusRequester = remember { FocusRequester() }
 
     // 输入弹框状态
     var showTmdbApiKeyDialog by remember { mutableStateOf(false) }
+    var showCustomLiveDialog by remember { mutableStateOf(false) }
+    var isRefreshingLive by remember { mutableStateOf(false) }
     var showM3u8ProxyDialog by remember { mutableStateOf(false) }
+    var showM3u8CustomProxyDialog by remember { mutableStateOf(false) }
+    var showEpgDialog by remember { mutableStateOf(false) }
 
     // 缓存清理确认弹框状态
     var showClearDoubanCacheDialog by remember { mutableStateOf(false) }
@@ -200,7 +210,9 @@ fun SettingsTab(
         bangumiDataSource = AppDataService.getBangumiDataSourceDisplayName()
         bangumiImageSource = AppDataService.getBangumiImageSourceDisplayName()
         tmdbApiKey = AppDataService.getTmdbApiKey()
+        customLiveUrl = AppDataService.getCustomLiveUrl()
         m3u8ProxyUrl = AppDataService.getM3u8ProxyUrl()
+        epgUrl = AppDataService.getEpgUrl()
         playerType = AppDataService.getPlayerTypeDisplayName()
         decodeMode = AppDataService.getDecodeModeDisplayName()
         searchOrigin = AppDataService.getSearchOriginDisplayName()
@@ -327,6 +339,66 @@ fun SettingsTab(
 
                 Spacer(modifier = Modifier.height(18.dp))
 
+                // —— 电视直播 ——
+                SectionLabel("电视直播")
+                val liveSourceDisplay = when {
+                    customLiveUrl.isBlank() -> "未配置 (支持 M3U/TXT/手机上传)"
+                    customLiveUrl.startsWith("/") || customLiveUrl.startsWith("file://") -> {
+                        val fn = java.io.File(customLiveUrl.removePrefix("file://")).name
+                        "本地文件: $fn"
+                    }
+                    else -> customLiveUrl
+                }
+                SettingRow(
+                    label = "直播源地址",
+                    value = liveSourceDisplay,
+                    onClick = { showCustomLiveDialog = true },
+                    modifier = Modifier.focusRequester(customLiveFocusRequester)
+                )
+                val m3u8ProxyDisplay = when (m3u8ProxyUrl) {
+                    "off", "direct" -> "直连 (关闭代理)"
+                    "local", "" -> "本地代理 (内置推荐)"
+                    else -> m3u8ProxyUrl
+                }
+                SettingRow(
+                    label = "M3U8 代理",
+                    value = m3u8ProxyDisplay,
+                    onClick = { showM3u8ProxyDialog = true },
+                    modifier = Modifier.focusRequester(m3u8ProxyFocusRequester)
+                )
+                SettingRow(
+                    label = "节目单 (EPG)",
+                    value = if (epgUrl.contains("jsdelivr") || epgUrl.contains("112114")) "默认 (fanmingming)" else epgUrl.ifEmpty { "默认 (fanmingming)" },
+                    onClick = { showEpgDialog = true },
+                    modifier = Modifier.focusRequester(epgFocusRequester)
+                )
+                SettingRow(
+                    label = if (isRefreshingLive) "刷新中..." else "立即刷新直播源",
+                    showDivider = false,
+                    onClick = {
+                        if (!isRefreshingLive) {
+                            isRefreshingLive = true
+                            coroutineScope.launch {
+                                try {
+                                    withContext(Dispatchers.IO) {
+                                        LiveService.clearAllCache()
+                                        LiveService.getLiveSources(forceRefresh = true)
+                                        Unit
+                                    }
+                                    org.moontechlab.selenetv.ui.MoonToast.show("直播源已重新加载")
+                                } catch (e: Exception) {
+                                    org.moontechlab.selenetv.ui.MoonToast.show("刷新失败: ${e.message}")
+                                } finally {
+                                    isRefreshingLive = false
+                                }
+                            }
+                        }
+                    },
+                    modifier = Modifier.focusRequester(refreshLiveFocusRequester)
+                )
+
+                Spacer(modifier = Modifier.height(18.dp))
+
                 // —— 数据源 ——
                 SectionLabel("数据源")
                 SettingRow(
@@ -357,15 +429,9 @@ fun SettingsTab(
                 SettingRow(
                     label = "TMDB API Key",
                     value = if (tmdbApiKey.isEmpty()) "未设置" else "已设置",
+                    showDivider = false,
                     onClick = { showTmdbApiKeyDialog = true },
                     modifier = Modifier.focusRequester(tmdbApiKeyFocusRequester)
-                )
-                SettingRow(
-                    label = "M3U8 代理",
-                    value = m3u8ProxyUrl.ifEmpty { "未设置" },
-                    showDivider = false,
-                    onClick = { showM3u8ProxyDialog = true },
-                    modifier = Modifier.focusRequester(m3u8ProxyFocusRequester)
                 )
 
                 if (!isLocalMode) {
@@ -671,20 +737,117 @@ fun SettingsTab(
         )
     }
 
-    // M3U8 代理输入弹框
+    // M3U8 代理模式选择弹框
+    val proxyOptions = remember { listOf("本地代理 (内置推荐)", "直连 (关闭代理)", "自定义代理链接...") }
+    val currentProxyOption = when (m3u8ProxyUrl) {
+        "off", "direct" -> "直连 (关闭代理)"
+        "local", "" -> "本地代理 (内置推荐)"
+        else -> "自定义代理链接..."
+    }
+
     AnimatedSelectDialog(
         visible = showM3u8ProxyDialog,
         onDismiss = { showM3u8ProxyDialog = false },
         onClosed = { m3u8ProxyFocusRequester.requestFocus() }
     ) { onClose ->
+        SourceSelectDialogContent(
+            title = "M3U8 代理模式",
+            options = proxyOptions,
+            currentValue = currentProxyOption,
+            onSelected = { selected ->
+                when (selected) {
+                    "本地代理 (内置推荐)" -> {
+                        coroutineScope.launch {
+                            AppDataService.saveM3u8ProxyUrl("local")
+                            m3u8ProxyUrl = "local"
+                        }
+                        onClose()
+                    }
+                    "直连 (关闭代理)" -> {
+                        coroutineScope.launch {
+                            AppDataService.saveM3u8ProxyUrl("off")
+                            m3u8ProxyUrl = "off"
+                        }
+                        onClose()
+                    }
+                    else -> {
+                        onClose()
+                        showM3u8CustomProxyDialog = true
+                    }
+                }
+            },
+            onDismiss = onClose
+        )
+    }
+
+    // 自定义 M3U8 代理地址弹框
+    AnimatedSelectDialog(
+        visible = showM3u8CustomProxyDialog,
+        onDismiss = { showM3u8CustomProxyDialog = false },
+        onClosed = { m3u8ProxyFocusRequester.requestFocus() }
+    ) { onClose ->
         TextInputDialogContent(
-            title = "M3U8 代理",
-            placeholder = "请输入 M3U8 代理地址",
-            initialValue = m3u8ProxyUrl,
+            title = "自定义 M3U8 代理地址",
+            placeholder = "请输入代理前缀（如 https://proxy.com/?url=）",
+            initialValue = if (m3u8ProxyUrl == "local" || m3u8ProxyUrl == "off") "" else m3u8ProxyUrl,
             onConfirm = { value ->
                 coroutineScope.launch {
-                    AppDataService.saveM3u8ProxyUrl(value)
-                    m3u8ProxyUrl = value
+                    val trimmed = value.trim()
+                    AppDataService.saveM3u8ProxyUrl(trimmed)
+                    m3u8ProxyUrl = trimmed
+                }
+                onClose()
+            },
+            onDismiss = onClose
+        )
+    }
+
+    // 节目单 (EPG) 地址弹框
+    AnimatedSelectDialog(
+        visible = showEpgDialog,
+        onDismiss = { showEpgDialog = false },
+        onClosed = { epgFocusRequester.requestFocus() }
+    ) { onClose ->
+        TextInputDialogContent(
+            title = "节目单 (EPG) 地址",
+            placeholder = "https://fastly.jsdelivr.net/gh/fanmingming/live@main/e.xml",
+            initialValue = epgUrl,
+            onConfirm = { value ->
+                coroutineScope.launch {
+                    val trimmed = value.trim()
+                    AppDataService.saveEpgUrl(trimmed)
+                    epgUrl = trimmed
+                    org.moontechlab.selenetv.service.EpgService.init(context, trimmed)
+                    org.moontechlab.selenetv.ui.MoonToast.show("节目单已更新并重新加载")
+                }
+                onClose()
+            },
+            onDismiss = onClose
+        )
+    }
+
+    // 自定义电视直播源弹框
+    AnimatedSelectDialog(
+        visible = showCustomLiveDialog,
+        onDismiss = { showCustomLiveDialog = false },
+        onClosed = { customLiveFocusRequester.requestFocus() }
+    ) { onClose ->
+        TextInputDialogContent(
+            title = "自定义电视直播源",
+            placeholder = "请输入 M3U/TXT 网络链接或本地文件路径，留空恢复默认",
+            initialValue = customLiveUrl,
+            onConfirm = { value: String ->
+                coroutineScope.launch {
+                    val trimmed = value.trim()
+                    AppDataService.saveCustomLiveUrl(trimmed)
+                    customLiveUrl = trimmed
+                    withContext(Dispatchers.IO) {
+                        LiveService.clearAllCache()
+                        Unit
+                    }
+                    org.moontechlab.selenetv.ui.MoonToast.show(
+                        if (trimmed.isEmpty()) "已清空自定义直播源" else "电视直播源已更新"
+                    )
                 }
                 onClose()
             },

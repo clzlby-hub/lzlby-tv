@@ -25,7 +25,9 @@ object AppDataService {
     private const val KEY_DOUBAN_IMAGE_SOURCE = "douban_image_source"
     private const val KEY_BANGUMI_DATA_SOURCE = "bangumi_data_source"
     private const val KEY_BANGUMI_IMAGE_SOURCE = "bangumi_image_source"
+    private const val KEY_CUSTOM_LIVE_URL = "custom_live_url"
     private const val KEY_M3U8_PROXY_URL = "m3u8_proxy_url"
+    private const val KEY_EPG_URL = "epg_url"
     private const val KEY_TMDB_API_KEY = "tmdb_api_key"
     private const val KEY_SESSION_TOKEN = "session_token"
     private const val KEY_PLAYER_TYPE = "player_type"
@@ -451,9 +453,9 @@ object AppDataService {
         SERVER_AGGREGATED("server", "服务端聚合搜索");
 
         companion object {
-            fun fromKey(key: String): SearchOrigin = entries.find { it.key == key } ?: TV_DIRECT
+            fun fromKey(key: String): SearchOrigin = entries.find { it.key == key } ?: SERVER_AGGREGATED
             fun fromDisplayName(displayName: String): SearchOrigin =
-                entries.find { it.displayName == displayName } ?: TV_DIRECT
+                entries.find { it.displayName == displayName } ?: SERVER_AGGREGATED
         }
     }
 
@@ -539,6 +541,28 @@ object AppDataService {
     // ==================== 其他设置 ====================
 
     /**
+     * 保存自定义电视直播源 URL 或 本地路径
+     */
+    suspend fun saveCustomLiveUrl(url: String) = withContext(Dispatchers.IO) {
+        saveCustomLiveUrlSync(url)
+    }
+
+    fun saveCustomLiveUrlSync(url: String) {
+        prefs.edit().putString(KEY_CUSTOM_LIVE_URL, url).apply()
+    }
+
+    /**
+     * 获取自定义电视直播源 URL 或 本地路径
+     */
+    suspend fun getCustomLiveUrl(): String = withContext(Dispatchers.IO) {
+        getCustomLiveUrlSync()
+    }
+
+    fun getCustomLiveUrlSync(): String {
+        return prefs.getString(KEY_CUSTOM_LIVE_URL, "") ?: ""
+    }
+
+    /**
      * 保存 M3U8 代理 URL
      */
     suspend fun saveM3u8ProxyUrl(url: String) = withContext(Dispatchers.IO) {
@@ -546,10 +570,32 @@ object AppDataService {
     }
 
     /**
-     * 获取 M3U8 代理 URL
+     * 获取 M3U8 代理 URL（默认使用内置本地代理 "local"）
      */
     suspend fun getM3u8ProxyUrl(): String = withContext(Dispatchers.IO) {
-        prefs.getString(KEY_M3U8_PROXY_URL, "") ?: ""
+        getM3u8ProxyUrlSync()
+    }
+
+    fun getM3u8ProxyUrlSync(): String {
+        return prefs.getString(KEY_M3U8_PROXY_URL, "local") ?: "local"
+    }
+
+    /**
+     * 保存 节目单 (EPG) URL
+     */
+    suspend fun saveEpgUrl(url: String) = withContext(Dispatchers.IO) {
+        prefs.edit().putString(KEY_EPG_URL, url).apply()
+    }
+
+    /**
+     * 获取 节目单 (EPG) URL（默认 112114 全国节目单）
+     */
+    suspend fun getEpgUrl(): String = withContext(Dispatchers.IO) {
+        getEpgUrlSync()
+    }
+
+    fun getEpgUrlSync(): String {
+        return prefs.getString(KEY_EPG_URL, "https://fastly.jsdelivr.net/gh/fanmingming/live@main/e.xml") ?: "https://fastly.jsdelivr.net/gh/fanmingming/live@main/e.xml"
     }
 
     /**
@@ -691,11 +737,11 @@ object AppDataService {
         prefs.edit().putString(KEY_SEARCH_ORIGIN, SearchOrigin.fromDisplayName(displayName).key).apply()
     }
     suspend fun getSearchOriginDisplayName(): String = withContext(Dispatchers.IO) {
-        SearchOrigin.fromKey(prefs.getString(KEY_SEARCH_ORIGIN, SearchOrigin.TV_DIRECT.key) ?: SearchOrigin.TV_DIRECT.key).displayName
+        SearchOrigin.fromKey(prefs.getString(KEY_SEARCH_ORIGIN, SearchOrigin.SERVER_AGGREGATED.key) ?: SearchOrigin.SERVER_AGGREGATED.key).displayName
     }
     fun getSearchOriginSync(): SearchOrigin {
         if (isLocalModeCache) return SearchOrigin.TV_DIRECT
-        return SearchOrigin.fromKey(prefs.getString(KEY_SEARCH_ORIGIN, SearchOrigin.TV_DIRECT.key) ?: SearchOrigin.TV_DIRECT.key)
+        return SearchOrigin.fromKey(prefs.getString(KEY_SEARCH_ORIGIN, SearchOrigin.SERVER_AGGREGATED.key) ?: SearchOrigin.SERVER_AGGREGATED.key)
     }
 
     // ==================== 应用更新偏好 ====================

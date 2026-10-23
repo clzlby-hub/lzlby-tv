@@ -10,9 +10,9 @@ import java.net.URLEncoder
  */
 object PlayProgress {
 
-    /** m3u8 代理拼接：代理为空返回原 URL，否则 URL-encode 后加前缀。 */
+    /** m3u8 代理拼接：代理为空或内置关键字返回原 URL，否则 URL-encode 后加前缀。 */
     fun buildPlayUrl(rawUrl: String, proxyUrl: String): String {
-        if (proxyUrl.isBlank()) return rawUrl
+        if (proxyUrl.isBlank() || proxyUrl == "local" || proxyUrl == "off" || proxyUrl == "direct" || !proxyUrl.startsWith("http")) return rawUrl
         // 用 String 重载而非 Charset 重载：后者需 API 33，minSdk 23 会触发 NewApi lint 错误
         return proxyUrl + URLEncoder.encode(rawUrl, "UTF-8")
     }

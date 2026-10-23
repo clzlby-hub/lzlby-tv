@@ -21,6 +21,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.focusRestorer
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.key.*
@@ -44,6 +45,7 @@ import androidx.tv.material3.Icon
 import androidx.tv.material3.Surface
 import androidx.tv.material3.Text
 import coil.compose.AsyncImage
+import coil.compose.SubcomposeAsyncImage
 import coil.request.ImageRequest
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -195,7 +197,7 @@ fun LiveTab(
                     LiveService.getLiveSources(forceRefresh)
                 }
                 if (sources.isEmpty()) {
-                    errorMessage = "暂无直播源"
+                    errorMessage = "暂无直播源\n可在「设置 ➔ 电视直播」配置链接，或用手机扫码上传本地 M3U 文件"
                     isLoading = false
                     return@launch
                 }
@@ -645,6 +647,53 @@ private fun ChannelGridRow(
     }
 }
 
+@Composable
+fun ChannelLogoFallback(
+    name: String,
+    modifier: Modifier = Modifier
+) {
+    val cleanName = remember(name) {
+        name.replace("CCTV-", "CCTV")
+            .replace("高清", "")
+            .replace("超清", "")
+            .replace("4K", "")
+            .replace("频道", "")
+            .trim()
+    }
+    val hash = remember(cleanName) { (cleanName.hashCode().let { if (it < 0) -it else it } % 360).toFloat() }
+    val c1 = remember(hash) { Color.hsl(hash, 0.60f, 0.28f) }
+    val c2 = remember(hash) { Color.hsl((hash + 45f) % 360f, 0.70f, 0.16f) }
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .background(Brush.linearGradient(listOf(c1, c2))),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+            modifier = Modifier.padding(horizontal = 6.dp)
+        ) {
+            Icon(
+                imageVector = Icons.Default.Tv,
+                contentDescription = null,
+                tint = Color.White.copy(alpha = 0.55f),
+                modifier = Modifier.size(24.dp)
+            )
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(
+                text = cleanName.take(6),
+                color = Color.White,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.Center,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
 // ==================== 频道卡片 ====================
 
 @Composable
@@ -720,14 +769,22 @@ private fun ChannelCard(
                     ),
                 contentAlignment = Alignment.Center
             ) {
-                if (channel.logo.isNotEmpty()) {
-                    AsyncImage(
+                val effectiveLogo = remember(channel.logo, channel.name) {
+                    org.moontechlab.selenetv.service.LiveService.normalizeLogoUrl(channel.logo, channel.name, channel.tvgId)
+                }
+                if (effectiveLogo.isNotEmpty()) {
+                    SubcomposeAsyncImage(
                         model = ImageRequest.Builder(context)
-                            .data(channel.logo)
-                            .addHeader("User-Agent", userAgent)
+                            .data(effectiveLogo)
                             .crossfade(true)
                             .build(),
                         contentDescription = channel.name,
+                        loading = {
+                            ChannelLogoFallback(name = channel.name)
+                        },
+                        error = {
+                            ChannelLogoFallback(name = channel.name)
+                        },
                         modifier = Modifier
                             .fillMaxSize()
                             .padding(if (isFocused) 3.dp else 0.dp)
@@ -736,16 +793,11 @@ private fun ChannelCard(
                                     if (isFocused) (cornerRadius.value * 0.67f).dp else cornerRadius
                                 )
                             )
-                            .padding(16.dp),
+                            .padding(14.dp),
                         contentScale = ContentScale.Fit
                     )
                 } else {
-                    Icon(
-                        imageVector = Icons.Default.Tv,
-                        contentDescription = null,
-                        tint = Color(0xFF555555),
-                        modifier = Modifier.size(48.dp)
-                    )
+                    ChannelLogoFallback(name = channel.name)
                 }
             }
 

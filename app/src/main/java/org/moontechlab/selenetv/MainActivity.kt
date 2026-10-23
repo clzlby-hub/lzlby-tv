@@ -85,11 +85,50 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        // 设置手机端上传本地直播源回调
+        RemoteControlServer.setLiveSourceUpdatedCallback { filePath ->
+            activityScope.launch(Dispatchers.IO) {
+                try {
+                    val file = java.io.File(filePath)
+                    val channels = org.moontechlab.selenetv.service.LiveService.getLiveChannels(
+                        org.moontechlab.selenetv.model.LiveSource(
+                            key = "custom_live",
+                            name = "本地电视",
+                            url = filePath,
+                            ua = ""
+                        ),
+                        forceRefresh = true
+                    )
+                    withContext(Dispatchers.Main) {
+                        org.moontechlab.selenetv.ui.MoonToast.show(
+                            "电视直播源已更新！\n文件: ${file.name}，共 ${channels.size} 个频道"
+                        )
+                    }
+                } catch (e: Exception) {
+                    withContext(Dispatchers.Main) {
+                        org.moontechlab.selenetv.ui.MoonToast.show("电视直播源已导入！")
+                    }
+                }
+            }
+        }
+
         // 设置手机传输/订阅推送回调
         RemoteControlServer.setSubscriptionCallback { payload ->
             activityScope.launch(Dispatchers.IO) {
                 try {
                     val trimmed = payload.trim()
+                    val isPureLive = trimmed.startsWith("#EXTM3U") ||
+                            ((trimmed.startsWith("http://") || trimmed.startsWith("https://")) &&
+                                    (trimmed.contains(".m3u") || trimmed.contains(".txt") || trimmed.contains("/live")))
+                    if (isPureLive) {
+                        AppDataService.saveCustomLiveUrl(trimmed)
+                        org.moontechlab.selenetv.service.LiveService.clearAllCache()
+                        withContext(Dispatchers.Main) {
+                            org.moontechlab.selenetv.ui.MoonToast.show("电视直播源已更新！")
+                        }
+                        return@launch
+                    }
+
                     val parsed = if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
                         SubscriptionService.parseSubscriptionJson(trimmed)
                     } else {
@@ -103,16 +142,28 @@ class MainActivity : ComponentActivity() {
                     } else {
                         trimmed
                     }
+                    val currentSearch = org.moontechlab.selenetv.data.Repositories.sources().getSearchResources()
+                    val currentLive = org.moontechlab.selenetv.data.Repositories.sources().getLiveSources()
+
+                    val finalSearch = if (parsed.searchResources.isNotEmpty()) parsed.searchResources else currentSearch
+                    val finalLive = if (parsed.searchResources.isEmpty() && parsed.liveSources.isNotEmpty()) {
+                        val first = parsed.liveSources.first()
+                        val merged = currentLive.filterNot { it.url == first.url || it.key == first.key }.toMutableList()
+                        listOf(first) + merged
+                    } else {
+                        parsed.liveSources
+                    }
+
                     org.moontechlab.selenetv.data.local.LocalStore.saveSubscriptionUrl(urlToSave)
                     org.moontechlab.selenetv.data.local.LocalStore.saveSubscriptionSources(
-                        parsed.searchResources,
-                        parsed.liveSources,
+                        finalSearch,
+                        finalLive,
                     )
                     AppDataService.saveIsLocalMode(true)
                     org.moontechlab.selenetv.service.LiveService.clearAllCache()
                     withContext(Dispatchers.Main) {
                         org.moontechlab.selenetv.ui.MoonToast.show(
-                            "手机传输订阅成功！\n搜索源: ${parsed.searchResources.size}，直播源: ${parsed.liveSources.size}"
+                            "手机传输导入成功！\n搜索源: ${finalSearch.size}，直播源: ${finalLive.size}"
                         )
                     }
                 } catch (e: Exception) {

@@ -156,6 +156,20 @@ object SubscriptionService {
                 trimmed
             }
         }
+        val isM3uOrTxt = text.startsWith("#EXTM3U") || text.contains("#genre#") || (text.contains(",") && text.contains("http"))
+        if (isM3uOrTxt) {
+            val name = if (urlOrPath.startsWith("http")) "网络直播源" else File(urlOrPath).nameWithoutExtension.ifEmpty { "本地直播源" }
+            val liveSource = LiveSource(
+                key = "live_${System.currentTimeMillis()}",
+                name = name,
+                url = urlOrPath,
+                ua = "AptvPlayer/1.4.10",
+                epg = "",
+                from = if (urlOrPath.startsWith("http")) "online" else "local",
+                disabled = false,
+            )
+            return ParsedSubscription(searchResources = emptyList(), liveSources = listOf(liveSource))
+        }
         return parseSubscriptionJson(text)
     }
 
