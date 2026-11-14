@@ -156,11 +156,13 @@ object SubscriptionService {
                 trimmed
             }
         }
-        val isM3uOrTxt = text.startsWith("#EXTM3U") || text.contains("#genre#") || (text.contains(",") && text.contains("http"))
+        val textTrimmed = text.trimStart()
+        val looksLikeJson = textTrimmed.startsWith("{") || textTrimmed.startsWith("[")
+        val isM3uOrTxt = !looksLikeJson && (text.startsWith("#EXTM3U") || text.contains("#genre#") || (text.contains(",") && text.contains("http")))
         if (isM3uOrTxt) {
             val name = if (urlOrPath.startsWith("http")) "网络直播源" else File(urlOrPath).nameWithoutExtension.ifEmpty { "本地直播源" }
             val liveSource = LiveSource(
-                key = "live_${System.currentTimeMillis()}",
+                key = stableLiveKey(urlOrPath),
                 name = name,
                 url = urlOrPath,
                 ua = "AptvPlayer/1.4.10",
@@ -265,35 +267,54 @@ object SubscriptionService {
         )
     }
 
+    private fun stableLiveKey(urlOrPath: String): String {
+        val bytes = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(urlOrPath.toByteArray(Charsets.UTF_8))
+        val hex = bytes.take(6).joinToString("") { "%02x".format(it) }
+        return "live_$hex"
+    }
+
     private fun httpGet(url: String): String {
-        val u = try {
-            java.net.URL(url)
-        } catch (e: java.net.MalformedURLException) {
-            throw SubscriptionException("订阅链接格式无效: ${e.message}")
-        }
-        val scheme = u.protocol?.lowercase()
-        if (scheme != "http" && scheme != "https") {
-            throw SubscriptionException("订阅链接协议不支持（仅 http/https）")
-        }
-        val conn = u.openConnection() as java.net.HttpURLConnection
-        if (conn is javax.net.ssl.HttpsURLConnection) {
-            conn.sslSocketFactory = trustAllSslSocketFactory()
-            conn.hostnameVerifier = javax.net.ssl.HostnameVerifier { _, _ -> true }
-        }
-        conn.requestMethod = "GET"
-        conn.instanceFollowRedirects = false
-        conn.connectTimeout = 10000
-        conn.readTimeout = 10000
-        try {
-            val code = conn.responseCode
-            if (code != 200) throw SubscriptionException("获取订阅内容失败 ($code)")
-            return conn.inputStream.use { input ->
-                val capped = readBytesCapped(input, MAX_SUBSCRIPTION_BYTES)
-                String(capped, Charsets.UTF_8).trim()
+        var currentUrl = url
+        var redirects = 0
+        while (redirects < 5) {
+            val u = try {
+                java.net.URL(currentUrl)
+            } catch (e: java.net.MalformedURLException) {
+                throw SubscriptionException("订阅链接格式无效: ${e.message}")
             }
-        } finally {
-            try { conn.disconnect() } catch (_: Exception) {}
+            val scheme = u.protocol?.lowercase()
+            if (scheme != "http" && scheme != "https") {
+                throw SubscriptionException("订阅链接协议不支持（仅 http/https）")
+            }
+            val conn = u.openConnection() as java.net.HttpURLConnection
+            if (conn is javax.net.ssl.HttpsURLConnection) {
+                conn.sslSocketFactory = trustAllSslSocketFactory()
+                conn.hostnameVerifier = javax.net.ssl.HostnameVerifier { _, _ -> true }
+            }
+            conn.requestMethod = "GET"
+            conn.instanceFollowRedirects = false
+            conn.connectTimeout = 10000
+            conn.readTimeout = 10000
+            try {
+                val code = conn.responseCode
+                if (code in 301..308) {
+                    val loc = conn.getHeaderField("Location")
+                        ?: throw SubscriptionException("订阅重定向缺少 Location ($code)")
+                    currentUrl = java.net.URL(u, loc).toString()
+                    redirects++
+                    continue
+                }
+                if (code != 200) throw SubscriptionException("获取订阅内容失败 ($code)")
+                return conn.inputStream.use { input ->
+                    val capped = readBytesCapped(input, MAX_SUBSCRIPTION_BYTES)
+                    String(capped, Charsets.UTF_8).trim()
+                }
+            } finally {
+                try { conn.disconnect() } catch (_: Exception) {}
+            }
         }
+        throw SubscriptionException("订阅链接重定向次数过多")
     }
 
     private fun readBytesCapped(input: InputStream, cap: Int): ByteArray {

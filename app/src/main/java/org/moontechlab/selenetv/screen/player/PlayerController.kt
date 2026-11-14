@@ -101,7 +101,7 @@ class PlayerController(
     override fun load(url: String, startMs: Long, playWhenReady: Boolean) {
         error = null
         hasStarted = false
-        val mediaItem = if (url.contains(".m3u8", ignoreCase = true) || url.contains("proxy", ignoreCase = true)) {
+        val mediaItem = if (isM3u8Url(url)) {
             MediaItem.Builder()
                 .setUri(url)
                 .setMimeType(androidx.media3.common.MimeTypes.APPLICATION_M3U8)
@@ -114,6 +114,16 @@ class PlayerController(
         if (startMs > 0) exo.seekTo(startMs)
         exo.playWhenReady = playWhenReady
         syncProgress()
+    }
+
+    private fun isM3u8Url(url: String): Boolean {
+        val targetParam = try {
+            android.net.Uri.parse(url).getQueryParameter("url")
+        } catch (_: Exception) {
+            null
+        }
+        val effective = targetParam ?: url
+        return effective.contains(".m3u8", ignoreCase = true)
     }
 
     @MainThread

@@ -121,7 +121,15 @@ class MainActivity : ComponentActivity() {
                             ((trimmed.startsWith("http://") || trimmed.startsWith("https://")) &&
                                     (trimmed.contains(".m3u") || trimmed.contains(".txt") || trimmed.contains("/live")))
                     if (isPureLive) {
-                        AppDataService.saveCustomLiveUrl(trimmed)
+                        val liveUrlToSave = if (trimmed.startsWith("#EXTM3U")) {
+                            val liveFile = java.io.File(filesDir, "live/remote_live.m3u")
+                            liveFile.parentFile?.mkdirs()
+                            liveFile.writeText(trimmed, Charsets.UTF_8)
+                            liveFile.absolutePath
+                        } else {
+                            trimmed
+                        }
+                        AppDataService.saveCustomLiveUrl(liveUrlToSave)
                         org.moontechlab.selenetv.service.LiveService.clearAllCache()
                         withContext(Dispatchers.Main) {
                             org.moontechlab.selenetv.ui.MoonToast.show("电视直播源已更新！")

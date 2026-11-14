@@ -95,7 +95,9 @@ class DoubanService private constructor(private val context: Context) {
         }
         
         val kindStr = kind.name.lowercase()
-        val apiUrl = "$baseUrl/rexxar/api/v2/subject/recent_hot/$kindStr?start=$start&limit=$limit&category=$category&type=$type"
+        val encodedCategory = URLEncoder.encode(category, "UTF-8")
+        val encodedType = URLEncoder.encode(type, "UTF-8")
+        val apiUrl = "$baseUrl/rexxar/api/v2/subject/recent_hot/$kindStr?start=$start&limit=$limit&category=$encodedCategory&type=$encodedType"
         
         return if (dataSourceKey == DoubanDataSourceKey.CORS_PROXY) {
             "https://ciao-cors.is-an.org/${URLEncoder.encode(apiUrl, "UTF-8")}"

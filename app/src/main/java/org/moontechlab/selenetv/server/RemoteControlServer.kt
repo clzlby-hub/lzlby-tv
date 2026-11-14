@@ -5,6 +5,7 @@ import org.json.JSONObject
 import org.moontechlab.selenetv.SeleneApplication
 import org.moontechlab.selenetv.service.AppDataService
 import org.moontechlab.selenetv.service.LiveService
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
@@ -17,7 +18,10 @@ import java.net.URLDecoder
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.SSLContext
@@ -32,6 +36,8 @@ object RemoteControlServer {
     private const val TAG = "RemoteControlServer"
     private const val START_PORT = 28256
     private const val MAX_PORT_ATTEMPTS = 100
+    private const val MAX_HEADER_BYTES = 64 * 1024
+    private const val MAX_M3U8_BYTES = 10 * 1024 * 1024
 
     private var serverSocket: ServerSocket? = null
     private var executor: ExecutorService? = null
@@ -85,20 +91,33 @@ object RemoteControlServer {
                 currentPort = port
                 isRunning.set(true)
 
-                val pool = Executors.newCachedThreadPool()
+                val pool = ThreadPoolExecutor(
+                    4,
+                    16,
+                    60L,
+                    TimeUnit.SECONDS,
+                    LinkedBlockingQueue(64),
+                )
                 executor = pool
 
-                pool.execute {
+                Thread({
                     Log.i(TAG, "RemoteControlServer listening on 0.0.0.0:$port")
                     while (isRunning.get() && !ss.isClosed) {
                         try {
                             val client = ss.accept()
-                            pool.execute { handleClient(client) }
+                            try {
+                                pool.execute { handleClient(client) }
+                            } catch (_: RejectedExecutionException) {
+                                try { client.close() } catch (_: Exception) {}
+                            }
                         } catch (e: Exception) {
                             if (!isRunning.get()) break
                             Log.w(TAG, "Error accepting client: ${e.message}")
                         }
                     }
+                }, "RemoteControlServer-accept").apply {
+                    isDaemon = true
+                    start()
                 }
                 return true
             } catch (e: Exception) {
@@ -131,11 +150,15 @@ object RemoteControlServer {
             val output = socket.getOutputStream()
 
             // 1. 读取 HTTP 头，精准匹配 \r\n\r\n
-            val headerBytes = java.io.ByteArrayOutputStream()
+            val headerBytes = ByteArrayOutputStream()
             var state = 0
             var b: Int
             while (input.read().also { b = it } != -1) {
                 headerBytes.write(b)
+                if (headerBytes.size() > MAX_HEADER_BYTES) {
+                    sendResponse(output, 431, "Request Header Fields Too Large", "text/plain", body = "Headers too large".toByteArray())
+                    return
+                }
                 if (b == 13 && (state == 0 || state == 2)) {
                     state++
                 } else if (b == 10 && (state == 1 || state == 3)) {
@@ -167,7 +190,11 @@ object RemoteControlServer {
 
             // 处理本地 M3U8 反向代理路由 (GET/HEAD /proxy... ?url=...)
             if ((method == "GET" || method == "HEAD") && path.startsWith("/proxy")) {
-                val queryUrl = if (rawPath.contains("url=")) rawPath.substringAfter("url=") else ""
+                val queryString = rawPath.substringAfter("?", "")
+                val queryUrl = queryString.split("&")
+                    .firstOrNull { it.startsWith("url=") }
+                    ?.substringAfter("url=")
+                    ?: ""
                 if (queryUrl.isNotEmpty()) {
                     val targetUrl = try {
                         URLDecoder.decode(queryUrl, "UTF-8")
@@ -261,11 +288,18 @@ object RemoteControlServer {
                         LiveService.clearAllCache()
                         liveSourceUpdatedCallback?.invoke(targetFile.absolutePath)
 
-                        val bytes = """{"status":"ok","path":"${targetFile.absolutePath}"}""".toByteArray(StandardCharsets.UTF_8)
+                        val respJson = JSONObject().apply {
+                            put("status", "ok")
+                            put("path", targetFile.absolutePath)
+                        }
+                        val bytes = respJson.toString().toByteArray(StandardCharsets.UTF_8)
                         sendResponse(output, 200, "OK", "application/json; charset=utf-8", body = bytes)
                     } catch (e: Exception) {
                         Log.e(TAG, "Upload failed: ${e.message}")
-                        sendResponse(output, 500, "Internal Server Error", "application/json; charset=utf-8", body = """{"error":"${e.message}"}""".toByteArray(StandardCharsets.UTF_8))
+                        val errJson = JSONObject().apply {
+                            put("error", e.message ?: "Upload failed")
+                        }
+                        sendResponse(output, 500, "Internal Server Error", "application/json; charset=utf-8", body = errJson.toString().toByteArray(StandardCharsets.UTF_8))
                     }
                 }
                 method == "POST" && path == "/api/key" -> {
@@ -336,6 +370,7 @@ object RemoteControlServer {
                     if (loc != null) {
                         targetUrl = URL(u, loc).toString()
                         conn.disconnect()
+                        conn = null
                         redirects++
                         continue
                     }
@@ -356,19 +391,16 @@ object RemoteControlServer {
 
             if (responseCode !in 200..299) {
                 sendResponse(output, responseCode, conn.responseMessage ?: "Error", contentType, body = "Upstream error $responseCode".toByteArray())
-                conn.disconnect()
                 return
             }
 
             if (method == "HEAD") {
                 sendResponse(output, responseCode, "OK", contentType)
-                conn.disconnect()
                 return
             }
 
             if (isM3u8) {
-                val bytes = conn.inputStream.readBytes()
-                conn.disconnect()
+                val bytes = readBytesCapped(conn.inputStream, MAX_M3U8_BYTES)
                 val text = String(bytes, StandardCharsets.UTF_8)
                 val upstreamUrl = URL(targetUrl)
                 val rewritten = rewriteM3u8(text, upstreamUrl)
@@ -399,7 +431,6 @@ object RemoteControlServer {
                     output.flush()
                 } finally {
                     try { stream.close() } catch (_: Exception) {}
-                    conn.disconnect()
                 }
             }
         } catch (e: Exception) {
@@ -407,7 +438,25 @@ object RemoteControlServer {
             try {
                 sendResponse(output, 500, "Internal Server Error", "text/plain", body = "Proxy error: ${e.message}".toByteArray())
             } catch (_: Exception) {}
+        } finally {
+            try { conn?.disconnect() } catch (_: Exception) {}
         }
+    }
+
+    private fun readBytesCapped(input: InputStream, maxBytes: Int): ByteArray {
+        val buf = ByteArrayOutputStream()
+        val tmp = ByteArray(8192)
+        var total = 0
+        input.use { stream ->
+            while (true) {
+                val n = stream.read(tmp)
+                if (n < 0) break
+                total += n
+                if (total > maxBytes) throw java.io.IOException("Response exceeds $maxBytes bytes limit")
+                buf.write(tmp, 0, n)
+            }
+        }
+        return buf.toByteArray()
     }
 
     private fun rewriteM3u8(content: String, upstreamUrl: URL): String {

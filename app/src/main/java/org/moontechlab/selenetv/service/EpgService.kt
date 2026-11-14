@@ -44,17 +44,24 @@ object EpgService {
         val allPrograms: List<EpgProgram> = emptyList(),
     )
 
-    private val epgMap = ConcurrentHashMap<String, MutableList<EpgProgram>>()
-    private val channelAliasMap = ConcurrentHashMap<String, String>() // tvgId/channelId -> displayName
+    @Volatile private var epgMap: ConcurrentHashMap<String, List<EpgProgram>> = ConcurrentHashMap()
+    @Volatile private var channelAliasMap: ConcurrentHashMap<String, String> = ConcurrentHashMap() // tvgId/channelId -> displayName
     @Volatile private var isInitialized = false
     @Volatile private var isLoading = false
-    private var lastLoadedDate: String = ""
+    @Volatile private var lastLoadedDate: String = ""
+    @Volatile private var lastLoadedUrl: String = ""
 
-    suspend fun init(context: Context, epgUrl: String) = withContext(Dispatchers.IO) {
-        if (isLoading) return@withContext
+    suspend fun init(context: Context, epgUrl: String, force: Boolean = false): Boolean = withContext(Dispatchers.IO) {
+        if (isLoading) return@withContext false
+
+        var url = epgUrl.trim().ifEmpty { DEFAULT_EPG_URL }
+        if (url.contains("112114.xyz", ignoreCase = true)) {
+            url = DEFAULT_EPG_URL
+        }
+        val isDiyp = url.contains("diyp", ignoreCase = true) || url.contains("?ch=", ignoreCase = true)
         val todayStr = SimpleDateFormat("yyyyMMdd", Locale.getDefault()).format(Date())
-        if (isInitialized && lastLoadedDate == todayStr && epgMap.isNotEmpty()) {
-            return@withContext
+        if (!force && isInitialized && lastLoadedDate == todayStr && lastLoadedUrl == url && (isDiyp || epgMap.isNotEmpty())) {
+            return@withContext true
         }
 
         // 优先使用 IPv4，防止 Android 电视在 IPv6 路由不通时超长挂起
@@ -62,30 +69,30 @@ object EpgService {
 
         isLoading = true
         try {
-            var url = epgUrl.trim().ifEmpty { DEFAULT_EPG_URL }
-            if (url.contains("112114.xyz", ignoreCase = true)) {
-                url = DEFAULT_EPG_URL
-            }
-            if (url.contains("diyp", ignoreCase = true) || url.contains("?ch=", ignoreCase = true)) {
+            if (isDiyp) {
                 // DIYP 模式，按需查询，无需全量下载
                 isInitialized = true
                 lastLoadedDate = todayStr
+                lastLoadedUrl = url
                 Log.i(TAG, "DIYP EPG configured: $url")
             } else {
                 try {
-                    loadXmltv(context, url, todayStr)
+                    loadXmltv(context, url, todayStr, force)
                 } catch (e: Exception) {
                     Log.w(TAG, "Primary EPG failed: ${e.message}, falling back to default")
                     if (url != DEFAULT_EPG_URL) {
-                        loadXmltv(context, DEFAULT_EPG_URL, todayStr)
+                        loadXmltv(context, DEFAULT_EPG_URL, todayStr, force)
                     } else throw e
                 }
                 isInitialized = true
                 lastLoadedDate = todayStr
+                lastLoadedUrl = url
                 Log.i(TAG, "XMLTV EPG loaded successfully, channels: ${epgMap.size}")
             }
+            true
         } catch (e: Exception) {
             Log.w(TAG, "Failed to load EPG: ${e.message}")
+            false
         } finally {
             isLoading = false
         }
@@ -131,20 +138,21 @@ object EpgService {
         val normId = normalizeChannelName(tvgId)
 
         // 尝试从内存缓存中查找
-        val programs = (if (normId.isNotEmpty()) epgMap[normId] else null)
-            ?: (if (normName.isNotEmpty()) epgMap[normName] else null)
-            ?: channelAliasMap[normId]?.let { epgMap[it] }
-            ?: channelAliasMap[normName]?.let { epgMap[it] }
-            ?: epgMap.entries.firstOrNull { (k, _) ->
+        val map = epgMap
+        val aliases = channelAliasMap
+        val sortedPrograms = (if (normId.isNotEmpty()) map[normId] else null)
+            ?: (if (normName.isNotEmpty()) map[normName] else null)
+            ?: aliases[normId]?.let { map[it] }
+            ?: aliases[normName]?.let { map[it] }
+            ?: map.entries.firstOrNull { (k, _) ->
                 (normName.isNotEmpty() && (k.contains(normName) || normName.contains(k))) ||
                 (normId.isNotEmpty() && (k.contains(normId) || normId.contains(k)))
             }?.value
 
-        if (programs.isNullOrEmpty()) {
+        if (sortedPrograms.isNullOrEmpty()) {
             return null
         }
 
-        val sortedPrograms = programs.sortedBy { it.startMs }
         var current: EpgProgram? = null
         var next: EpgProgram? = null
 
@@ -212,7 +220,7 @@ object EpgService {
             }
 
             if (programs.isNotEmpty()) {
-                epgMap[normName] = programs
+                epgMap[normName] = programs.sortedBy { it.startMs }
                 return@withContext getChannelEpg(channelName)
             }
         } catch (e: Exception) {
@@ -221,11 +229,16 @@ object EpgService {
         return@withContext null
     }
 
-    private fun loadXmltv(context: Context, epgUrl: String, todayStr: String) {
-        val cacheFile = File(context.cacheDir, "epg_${todayStr}.xml")
-        if (!cacheFile.exists() || cacheFile.length() < 1024) {
-            // 清理旧日期的缓存
-            context.cacheDir.listFiles { _, name -> name.startsWith("epg_") && name.endsWith(".xml") }?.forEach {
+    private fun shortHash(input: String): String {
+        val bytes = java.security.MessageDigest.getInstance("SHA-256").digest(input.toByteArray(Charsets.UTF_8))
+        return bytes.take(6).joinToString("") { "%02x".format(it) }
+    }
+
+    private fun loadXmltv(context: Context, epgUrl: String, todayStr: String, force: Boolean = false) {
+        val cacheFile = File(context.cacheDir, "epg_${todayStr}_${shortHash(epgUrl)}.xml")
+        if (force || !cacheFile.exists() || cacheFile.length() < 1024) {
+            // 清理旧缓存
+            context.cacheDir.listFiles { _, name -> name.startsWith("epg_") && name.endsWith(".xml") && name != cacheFile.name }?.forEach {
                 it.delete()
             }
             Log.i(TAG, "Downloading EPG from $epgUrl ...")
@@ -234,10 +247,10 @@ object EpgService {
 
         if (cacheFile.exists() && cacheFile.length() > 0) {
             Log.i(TAG, "Parsing EPG file: ${cacheFile.length()} bytes")
-            epgMap.clear()
-            channelAliasMap.clear()
             FileInputStream(cacheFile).use { input ->
-                parseXmltvStream(input)
+                val (newEpgMap, newAliasMap) = parseXmltvStream(input)
+                epgMap = newEpgMap
+                channelAliasMap = newAliasMap
             }
         }
     }
@@ -280,16 +293,23 @@ object EpgService {
         }
     }
 
-    private fun parseXmltvStream(input: InputStream) {
+    private fun parseXmltvStream(input: InputStream): Pair<ConcurrentHashMap<String, List<EpgProgram>>, ConcurrentHashMap<String, String>> {
         val parser = Xml.newPullParser()
         parser.setInput(input, "UTF-8")
+
+        val localEpgMap = HashMap<String, MutableList<EpgProgram>>()
+        val localAliasMap = ConcurrentHashMap<String, String>()
 
         var eventType = parser.eventType
         var currentChannelId = ""
         var currentStartStr = ""
         var currentStopStr = ""
         var currentTitle = ""
-        val timeFormat = SimpleDateFormat("yyyyMMddHHmmss", Locale.getDefault())
+        val utcFormat = SimpleDateFormat("yyyyMMddHHmmss", Locale.US).apply {
+            timeZone = java.util.TimeZone.getTimeZone("UTC")
+        }
+        val localFormat = SimpleDateFormat("yyyyMMddHHmmss", Locale.US)
+        val displayFormat = SimpleDateFormat("HH:mm", Locale.getDefault())
 
         while (eventType != XmlPullParser.END_DOCUMENT) {
             val name = parser.name
@@ -304,8 +324,8 @@ object EpgService {
                             val displayName = parser.nextText().trim()
                             if (currentChannelId.isNotEmpty() && displayName.isNotEmpty()) {
                                 val normDisplay = normalizeChannelName(displayName)
-                                channelAliasMap[currentChannelId] = normDisplay
-                                channelAliasMap[normDisplay] = currentChannelId
+                                localAliasMap[currentChannelId] = normDisplay
+                                localAliasMap[normDisplay] = currentChannelId
                             }
                         }
                         "programme" -> {
@@ -322,10 +342,10 @@ object EpgService {
                 }
                 XmlPullParser.END_TAG -> {
                     if (name == "programme" && currentChannelId.isNotEmpty() && currentTitle.isNotEmpty()) {
-                        val startMs = parseTimestamp(currentStartStr, timeFormat)
-                        val stopMs = parseTimestamp(currentStopStr, timeFormat)
-                        val startDisplay = formatTime(startMs)
-                        val stopDisplay = formatTime(stopMs)
+                        val startMs = parseTimestamp(currentStartStr, utcFormat, localFormat)
+                        val stopMs = parseTimestamp(currentStopStr, utcFormat, localFormat)
+                        val startDisplay = formatTime(startMs, displayFormat)
+                        val stopDisplay = formatTime(stopMs, displayFormat)
 
                         val prog = EpgProgram(
                             title = currentTitle,
@@ -334,26 +354,50 @@ object EpgService {
                             startMs = startMs,
                             stopMs = stopMs,
                         )
-                        epgMap.getOrPut(currentChannelId) { mutableListOf() }.add(prog)
+                        localEpgMap.getOrPut(currentChannelId) { mutableListOf() }.add(prog)
                     }
                 }
             }
             eventType = parser.next()
         }
+
+        val immutableEpgMap = ConcurrentHashMap<String, List<EpgProgram>>(localEpgMap.size)
+        for ((k, list) in localEpgMap) {
+            immutableEpgMap[k] = list.sortedBy { it.startMs }
+        }
+        return immutableEpgMap to localAliasMap
     }
 
-    private fun parseTimestamp(raw: String, format: SimpleDateFormat): Long {
-        if (raw.length < 14) return 0L
+    private fun parseTimestamp(raw: String, utcFormat: SimpleDateFormat, localFormat: SimpleDateFormat): Long {
+        val trimmed = raw.trim()
+        if (trimmed.length < 14) return 0L
         return try {
-            val core = raw.substring(0, 14)
-            format.parse(core)?.time ?: 0L
+            val core = trimmed.substring(0, 14)
+            val tzPart = trimmed.substring(14).trim()
+            if (tzPart.isEmpty()) {
+                localFormat.parse(core)?.time ?: 0L
+            } else if (tzPart.equals("Z", ignoreCase = true) || tzPart.equals("UTC", ignoreCase = true) || tzPart.equals("GMT", ignoreCase = true)) {
+                utcFormat.parse(core)?.time ?: 0L
+            } else {
+                val match = Regex("""^([+-])(\d{2}):?(\d{2})$""").find(tzPart)
+                if (match != null) {
+                    val sign = if (match.groupValues[1] == "-") -1L else 1L
+                    val hours = match.groupValues[2].toLong()
+                    val mins = match.groupValues[3].toLong()
+                    val offsetMs = sign * (hours * 3600_000L + mins * 60_000L)
+                    val utcMs = utcFormat.parse(core)?.time ?: return 0L
+                    utcMs - offsetMs
+                } else {
+                    localFormat.parse(core)?.time ?: 0L
+                }
+            }
         } catch (_: Exception) {
             0L
         }
     }
 
-    private fun formatTime(epochMs: Long): String {
+    private fun formatTime(epochMs: Long, format: SimpleDateFormat): String {
         if (epochMs <= 0L) return "--:--"
-        return SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(epochMs))
+        return format.format(Date(epochMs))
     }
 }

@@ -220,7 +220,7 @@ fun SettingsTab(
         val ips = withContext(Dispatchers.IO) { getAllIpAddresses() }
         availableIps = ips
         if (selectedIp.isEmpty()) {
-            selectedIp = ips.find { it.startsWith("192.168.") } ?: ips.firstOrNull() ?: ""
+            selectedIp = ips.firstOrNull() ?: ""
         }
         isLocalMode = AppDataService.isLocalMode()
         if (isLocalMode) {
@@ -817,8 +817,12 @@ fun SettingsTab(
                     val trimmed = value.trim()
                     AppDataService.saveEpgUrl(trimmed)
                     epgUrl = trimmed
-                    org.moontechlab.selenetv.service.EpgService.init(context, trimmed)
-                    org.moontechlab.selenetv.ui.MoonToast.show("节目单已更新并重新加载")
+                    val ok = org.moontechlab.selenetv.service.EpgService.init(context, trimmed, force = true)
+                    if (ok) {
+                        org.moontechlab.selenetv.ui.MoonToast.show("节目单已更新并重新加载")
+                    } else {
+                        org.moontechlab.selenetv.ui.MoonToast.show("节目单加载失败，请检查地址或网络")
+                    }
                 }
                 onClose()
             },

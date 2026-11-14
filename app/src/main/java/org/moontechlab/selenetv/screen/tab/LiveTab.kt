@@ -162,9 +162,12 @@ fun LiveTab(
         }
     }
 
+    val loadChannelsJobHolder = remember { object { var job: kotlinx.coroutines.Job? = null } }
+
     // 加载频道数据
     fun loadChannels(source: LiveSource) {
-        coroutineScope.launch {
+        loadChannelsJobHolder.job?.cancel()
+        loadChannelsJobHolder.job = coroutineScope.launch {
             // 清空旧数据以显示骨架屏
             channelGroups = emptyList()
             selectedGroup = "all"
@@ -179,6 +182,8 @@ fun LiveTab(
                 } else {
                     channelGroups = LiveService.groupChannels(channels)
                 }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
                 errorMessage = "加载频道失败: ${e.message}"
                 Log.e(TAG, "加载频道失败", e)

@@ -182,11 +182,19 @@ class MpvPlayerController(
 
     override fun release() {
         if (released) return
+        if (surfaceAttached) {
+            surfaceAttached = false
+            try {
+                mpv.setPropertyString("vo", "null")
+                mpv.setOptionString("force-window", "no")
+                mpv.detachSurface()
+            } catch (_: Throwable) {}
+        }
         released = true
         mpv.removeObserver(this)
         // mpv.destroy()（尤其硬解 MediaCodec teardown）在主线程会阻塞 ~150ms，正好落在返回直播 tab
         // 的焦点还原窗口内（还原协程也跑在主线程），把它挤占/饿死 → 焦点还原偶发失败或抖动。
-        // 放到后台线程释放：此时已 removeObserver、surface 也已在 surfaceDestroyed 里 detach，
+        // 放到后台线程释放：此时已 removeObserver、surface 也已在主线程同步 detach，
         // 不会再有其它 MPVLib 调用与之并发。
         val player = mpv
         Thread({
