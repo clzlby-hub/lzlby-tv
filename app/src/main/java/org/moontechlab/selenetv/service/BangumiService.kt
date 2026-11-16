@@ -68,7 +68,7 @@ class BangumiService private constructor(private val context: Context) {
                 ?.takeIf { it.isNotEmpty() }
             if (server != null) {
                 val cookies = AppDataService.getCookiesSync()
-                if (cookies.isNotEmpty()) {
+                if (!cookies.isNullOrEmpty()) {
                     baseHeaders["Cookie"] = cookies
                 }
                 return "$server/api/bangumi$path" to baseHeaders
