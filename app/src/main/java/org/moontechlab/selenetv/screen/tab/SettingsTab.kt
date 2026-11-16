@@ -368,7 +368,7 @@ fun SettingsTab(
                 )
                 SettingRow(
                     label = "节目单 (EPG)",
-                    value = if (epgUrl.contains("jsdelivr") || epgUrl.contains("112114")) "默认 (fanmingming)" else epgUrl.ifEmpty { "默认 (fanmingming)" },
+                    value = if (epgUrl.contains("epg.v1.mk") || epgUrl.contains("jsdelivr") || epgUrl.contains("112114")) "默认 (epg.v1.mk)" else epgUrl.ifEmpty { "默认 (epg.v1.mk)" },
                     onClick = { showEpgDialog = true },
                     modifier = Modifier.focusRequester(epgFocusRequester)
                 )

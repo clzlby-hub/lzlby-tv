@@ -27,7 +27,12 @@ import javax.net.ssl.X509TrustManager
  */
 object EpgService {
     private const val TAG = "EpgService"
-    private const val DEFAULT_EPG_URL = "https://fastly.jsdelivr.net/gh/fanmingming/live@main/e.xml"
+    private const val DEFAULT_EPG_URL = "https://epg.v1.mk/fy.xml"
+    private val FALLBACK_EPG_URLS = listOf(
+        "https://epg.v1.mk/fy.xml",
+        "https://gcore.jsdelivr.net/gh/fanmingming/live@main/e.xml",
+        "https://testingcf.jsdelivr.net/gh/fanmingming/live@main/e.xml"
+    )
 
     data class EpgProgram(
         val title: String,
@@ -79,10 +84,21 @@ object EpgService {
                 try {
                     loadXmltv(context, url, todayStr, force)
                 } catch (e: Exception) {
-                    Log.w(TAG, "Primary EPG failed: ${e.message}, falling back to default")
-                    if (url != DEFAULT_EPG_URL) {
-                        loadXmltv(context, DEFAULT_EPG_URL, todayStr, force)
-                    } else throw e
+                    Log.w(TAG, "Primary EPG failed: ${e.message}, trying fallback URLs")
+                    var loaded = false
+                    var lastErr: Exception = e
+                    for (fallback in FALLBACK_EPG_URLS) {
+                        if (fallback == url) continue
+                        try {
+                            loadXmltv(context, fallback, todayStr, force)
+                            loaded = true
+                            break
+                        } catch (fe: Exception) {
+                            Log.w(TAG, "Fallback EPG ($fallback) failed: ${fe.message}")
+                            lastErr = fe
+                        }
+                    }
+                    if (!loaded) throw lastErr
                 }
                 isInitialized = true
                 lastLoadedDate = todayStr

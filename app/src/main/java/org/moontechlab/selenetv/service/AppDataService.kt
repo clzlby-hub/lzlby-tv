@@ -592,7 +592,7 @@ object AppDataService {
     }
 
     fun getEpgUrlSync(): String {
-        return prefs.getString(KEY_EPG_URL, "https://fastly.jsdelivr.net/gh/fanmingming/live@main/e.xml") ?: "https://fastly.jsdelivr.net/gh/fanmingming/live@main/e.xml"
+        return prefs.getString(KEY_EPG_URL, "https://epg.v1.mk/fy.xml") ?: "https://epg.v1.mk/fy.xml"
     }
 
     /**
