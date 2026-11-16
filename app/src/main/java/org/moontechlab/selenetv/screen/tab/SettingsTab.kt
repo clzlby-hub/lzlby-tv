@@ -415,13 +415,13 @@ fun SettingsTab(
                 )
                 SettingRow(
                     label = "Bangumi 数据源",
-                    value = bangumiDataSource.ifEmpty { "直连" },
+                    value = bangumiDataSource.ifEmpty { "服务器代理" },
                     onClick = { showBangumiDataSourceDialog = true },
                     modifier = Modifier.focusRequester(bangumiDataSourceFocusRequester)
                 )
                 SettingRow(
                     label = "Bangumi 图片源",
-                    value = bangumiImageSource.ifEmpty { "直连" },
+                    value = bangumiImageSource.ifEmpty { "服务器代理" },
                     onClick = { showBangumiImageSourceDialog = true },
                     modifier = Modifier.focusRequester(bangumiImageSourceFocusRequester)
                 )
@@ -598,7 +598,9 @@ fun SettingsTab(
     ) { onClose ->
         SourceSelectDialogContent(
             title = "选择 Bangumi 数据源",
-            options = AppDataService.BangumiDataSource.entries.map { it.displayName },
+            options = AppDataService.BangumiDataSource.entries
+                .filterNot { isLocalMode && it == AppDataService.BangumiDataSource.SERVER_PROXY }
+                .map { it.displayName },
             currentValue = bangumiDataSource,
             onSelected = { displayName ->
                 coroutineScope.launch {

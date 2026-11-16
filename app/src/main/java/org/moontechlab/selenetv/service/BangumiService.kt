@@ -55,6 +55,29 @@ class BangumiService private constructor(private val context: Context) {
     }
 
     /**
+     * 构造 Bangumi 请求 URL 与请求头；server_proxy 走自托管 /api/bangumi 代理并附带登录 Cookie。
+     */
+    private fun buildBangumiRequest(path: String): Pair<String, Map<String, String>> {
+        val baseHeaders = mutableMapOf(
+            "User-Agent" to USER_AGENT,
+            "Accept" to "application/json"
+        )
+        if (AppDataService.getBangumiDataSourceKeySync() == "server_proxy") {
+            val server = AppDataService.getServerUrlSync()
+                ?.trimEnd('/')
+                ?.takeIf { it.isNotEmpty() }
+            if (server != null) {
+                val cookies = AppDataService.getCookiesSync()
+                if (cookies.isNotEmpty()) {
+                    baseHeaders["Cookie"] = cookies
+                }
+                return "$server/api/bangumi$path" to baseHeaders
+            }
+        }
+        return "https://${bangumiHost()}$path" to baseHeaders
+    }
+
+    /**
      * 初始化缓存服务（加锁保证并发请求下只初始化一次）
      */
     private suspend fun initCache() {
@@ -146,12 +169,8 @@ class BangumiService private constructor(private val context: Context) {
         }
         
         return try {
-            val headers = mapOf(
-                "User-Agent" to USER_AGENT,
-                "Accept" to "application/json"
-            )
-            
-            val (statusCode, responseBody) = httpGet("https://${bangumiHost()}/calendar", headers)
+            val (apiUrl, headers) = buildBangumiRequest("/calendar")
+            val (statusCode, responseBody) = httpGet(apiUrl, headers)
             
             if (statusCode == HttpURLConnection.HTTP_OK) {
                 try {
@@ -214,12 +233,7 @@ class BangumiService private constructor(private val context: Context) {
         }
         
         return try {
-            val apiUrl = "https://${bangumiHost()}/v0/subjects/$bangumiId"
-            val headers = mapOf(
-                "User-Agent" to USER_AGENT,
-                "Accept" to "application/json"
-            )
-            
+            val (apiUrl, headers) = buildBangumiRequest("/v0/subjects/$bangumiId")
             val (statusCode, responseBody) = httpGet(apiUrl, headers)
             
             if (statusCode == HttpURLConnection.HTTP_OK) {

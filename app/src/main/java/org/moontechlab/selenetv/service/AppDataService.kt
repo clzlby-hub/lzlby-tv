@@ -390,20 +390,21 @@ object AppDataService {
     }
 
     /**
-     * Bangumi 数据源枚举：除 DIRECT 外，其余在请求 bgm API 时将 host 整体替换。
+     * Bangumi 数据源枚举：SERVER_PROXY 走自托管 /api/bangumi 代理，其余在请求 bgm API 时将 host 整体替换。
      */
     enum class BangumiDataSource(val key: String, val displayName: String) {
         DIRECT("direct", "直连"),
+        SERVER_PROXY("server_proxy", "服务器代理"),
         CDN_TENCENT("cdn_tencent", "Bangumi CDN By CMLiussss（腾讯云）"),
         CDN_ALIYUN("cdn_aliyun", "Bangumi CDN By CMLiussss（阿里云）"),
         CDN_SHINYA("cdn_shinya", "Bangumi CDN By Shinya（CF 优选）");
 
         companion object {
             fun fromKey(key: String): BangumiDataSource =
-                entries.find { it.key == key } ?: DIRECT
+                entries.find { it.key == key } ?: SERVER_PROXY
 
             fun fromDisplayName(displayName: String): BangumiDataSource =
-                entries.find { it.displayName == displayName } ?: DIRECT
+                entries.find { it.displayName == displayName } ?: SERVER_PROXY
         }
     }
 
@@ -518,9 +519,7 @@ object AppDataService {
     }
 
     suspend fun getBangumiDataSourceDisplayName(): String = withContext(Dispatchers.IO) {
-        val key = prefs.getString(KEY_BANGUMI_DATA_SOURCE, BangumiDataSource.DIRECT.key)
-            ?: BangumiDataSource.DIRECT.key
-        BangumiDataSource.fromKey(key).displayName
+        BangumiDataSource.fromKey(getBangumiDataSourceKeySync()).displayName
     }
 
     /**
@@ -532,9 +531,7 @@ object AppDataService {
     }
 
     suspend fun getBangumiImageSourceDisplayName(): String = withContext(Dispatchers.IO) {
-        val key = prefs.getString(KEY_BANGUMI_IMAGE_SOURCE, BangumiImageSource.DIRECT.key)
-            ?: BangumiImageSource.DIRECT.key
-        BangumiImageSource.fromKey(key).displayName
+        BangumiImageSource.fromKey(getBangumiImageSourceKeySync()).displayName
     }
 
 
@@ -695,18 +692,22 @@ object AppDataService {
     }
 
     /**
-     * 同步获取 Bangumi 数据源 Key
+     * 同步获取 Bangumi 数据源 Key（默认走服务器代理；本地模式回退直连）。
      */
-    fun getBangumiDataSourceKeySync(): String =
-        prefs.getString(KEY_BANGUMI_DATA_SOURCE, BangumiDataSource.DIRECT.key)
-            ?: BangumiDataSource.DIRECT.key
+    fun getBangumiDataSourceKeySync(): String {
+        val raw = prefs.getString(KEY_BANGUMI_DATA_SOURCE, BangumiDataSource.SERVER_PROXY.key)
+            ?: BangumiDataSource.SERVER_PROXY.key
+        return if (isLocalModeCache && raw == BangumiDataSource.SERVER_PROXY.key)
+            BangumiDataSource.DIRECT.key
+        else raw
+    }
 
     /**
-     * 同步获取 Bangumi 图片源 Key。本地模式兜底同 douban。
+     * 同步获取 Bangumi 图片源 Key（默认走服务器代理；本地模式回退直连）。
      */
     fun getBangumiImageSourceKeySync(): String {
-        val raw = prefs.getString(KEY_BANGUMI_IMAGE_SOURCE, BangumiImageSource.DIRECT.key)
-            ?: BangumiImageSource.DIRECT.key
+        val raw = prefs.getString(KEY_BANGUMI_IMAGE_SOURCE, BangumiImageSource.SERVER_PROXY.key)
+            ?: BangumiImageSource.SERVER_PROXY.key
         return if (isLocalModeCache && raw == BangumiImageSource.SERVER_PROXY.key)
             BangumiImageSource.DIRECT.key
         else raw
